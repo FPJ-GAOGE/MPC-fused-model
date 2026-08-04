@@ -1,0 +1,305 @@
+"""Measurement -> rotation-aware filter -> fusion -> yaw MPC -> FineSUB mixer."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+
+from MPC_dual_model.device_adapter import (
+    DeviceCommand,
+    FineSUBThrusterAllocator,
+    ForceCommandAdapter,
+    ThrusterAllocation,
+)
+from MPC_dual_model.fossen_fixed_dl_model import vector3
+from MPC_dual_model.model_fusion import FusionConfig, OnlineModelFusion
+
+from .yaw_kalman import RotationAwareKalmanFilter
+from .yaw_mpc_controller import RotationAwareMPCController, YawMPCResult
+from .yaw_relative_model import (
+    RotationAwareRelativeModel,
+    finite_scalar,
+    line_of_sight_angle,
+    wrap_angle,
+)
+
+
+DEFAULT_STAIRCASE_HORIZON_CAPS = (3, 3, 2, 2, 1, 1)
+DEFAULT_PREDICTION_HORIZON_WEIGHTS = (0.5, 0.3, 0.2)
+
+
+def build_default_staircase_fusion() -> OnlineModelFusion:
+    """Match the maintained translation tracker's 2-D staircase score."""
+    return OnlineModelFusion(
+        FusionConfig(
+            window=len(DEFAULT_STAIRCASE_HORIZON_CAPS),
+            prediction_horizon=len(DEFAULT_PREDICTION_HORIZON_WEIGHTS),
+            forgetting_factor=0.8,
+            prediction_horizon_weights=DEFAULT_PREDICTION_HORIZON_WEIGHTS,
+            staircase_horizon_caps=DEFAULT_STAIRCASE_HORIZON_CAPS,
+            initial_model1_weight=(0.80, 0.80, 0.80),
+            minimum_weight=0.05,
+        )
+    )
+
+
+@dataclass
+class YawMomentChannelAdapter:
+    """Convert physical yaw moment N*m to FineSUB normalized yaw input."""
+
+    positive_yaw_moment_at_limit: float = 4.0
+    channel_limit: float = 0.20
+    sign: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.positive_yaw_moment_at_limit = finite_scalar(
+            self.positive_yaw_moment_at_limit,
+            "positive_yaw_moment_at_limit",
+        )
+        self.channel_limit = finite_scalar(self.channel_limit, "channel_limit")
+        self.sign = finite_scalar(self.sign, "sign")
+        if self.positive_yaw_moment_at_limit <= 0.0:
+            raise ValueError("positive_yaw_moment_at_limit must be positive")
+        if self.channel_limit <= 0.0:
+            raise ValueError("channel_limit must be positive")
+        if abs(self.sign) != 1.0:
+            raise ValueError("sign must be +1 or -1")
+
+    def convert(self, yaw_moment: float) -> float:
+        moment = finite_scalar(yaw_moment, "yaw_moment")
+        raw = (
+            self.sign
+            * moment
+            / self.positive_yaw_moment_at_limit
+            * self.channel_limit
+        )
+        return float(np.clip(raw, -self.channel_limit, self.channel_limit))
+
+
+@dataclass
+class YawTrackerOutput:
+    estimated_state: np.ndarray
+    yaw_rate: float
+    line_of_sight_angle: float
+    yaw_channel: float
+    mpc: YawMPCResult
+    device_command: DeviceCommand
+    thruster_allocation: ThrusterAllocation | None
+
+
+@dataclass
+class YawSafeControlOutput:
+    force: np.ndarray
+    yaw_moment: float
+    yaw_channel: float
+    device_command: DeviceCommand
+    status: str
+
+
+@dataclass
+class _PendingRotatingPrediction:
+    origin_index: int
+    state1: np.ndarray
+    state2: np.ndarray
+    force_previous: np.ndarray
+    steps: int = 0
+
+
+class RotationAwareMPCTracker:
+    """High-level yaw experiment entry point.
+
+    ``yaw_rad`` and ``yaw_rate_rad_s`` must come from the IMU/attitude
+    estimator at the camera exposure time.  The actual angle difference is
+    used for filtering and historical model scoring; MPC uses yaw rate to form
+    its frozen future rotation schedule.
+    """
+
+    def __init__(
+        self,
+        model: RotationAwareRelativeModel,
+        estimator: RotationAwareKalmanFilter,
+        controller: RotationAwareMPCController,
+        force_adapter: ForceCommandAdapter,
+        yaw_adapter: YawMomentChannelAdapter,
+        fusion: OnlineModelFusion | None = None,
+        thruster_allocator: FineSUBThrusterAllocator | None = None,
+    ) -> None:
+        if estimator.model is not model or controller.model is not model:
+            raise ValueError("model, estimator.model, and controller.model must match")
+        self.model = model
+        self.estimator = estimator
+        self.controller = controller
+        self.force_adapter = force_adapter
+        self.yaw_adapter = yaw_adapter
+        self.fusion = fusion or build_default_staircase_fusion()
+        self.thruster_allocator = thruster_allocator
+        self._force_before_last = np.zeros(3)
+        self._yaw_moment_before_last = 0.0
+        self._yaw_previous: float | None = None
+        self._pending: deque[_PendingRotatingPrediction] = deque()
+        self._frame_index = -1
+
+    def latch_baseline(
+        self,
+        force_achieved,
+        yaw_moment_achieved: float = 0.0,
+        yaw_rad: float | None = None,
+    ) -> None:
+        force = vector3(force_achieved, "force_achieved")
+        moment = finite_scalar(yaw_moment_achieved, "yaw_moment_achieved")
+        self.model.translation.set_tau_base(force)
+        self.model.yaw.set_yaw_moment_base(moment)
+        self._force_before_last = force.copy()
+        self._yaw_moment_before_last = moment
+        self._yaw_previous = None if yaw_rad is None else finite_scalar(yaw_rad, "yaw_rad")
+        self.fusion.reset()
+        self.controller.reset()
+        self._pending.clear()
+        self._frame_index = -1
+
+    def target_lost(
+        self,
+        force_achieved_previous,
+        yaw_moment_achieved_previous: float,
+    ) -> YawSafeControlOutput:
+        self.controller.reset()
+        self._pending.clear()
+        force, moment = self.controller.safe_input(
+            force_achieved_previous, yaw_moment_achieved_previous
+        )
+        yaw_channel = self.yaw_adapter.convert(moment)
+        return YawSafeControlOutput(
+            force=force,
+            yaw_moment=moment,
+            yaw_channel=yaw_channel,
+            device_command=self.force_adapter.convert(force),
+            status="target_lost:return_to_force_and_yaw_baseline",
+        )
+
+    def _score_completed_predictions(
+        self,
+        filtered_position: np.ndarray,
+        force_achieved: np.ndarray,
+        delta_yaw: float,
+    ) -> None:
+        retained: deque[_PendingRotatingPrediction] = deque()
+        for record in self._pending:
+            record.state1 = self.model.predict_model1(
+                record.state1,
+                force_achieved,
+                record.force_previous,
+                delta_yaw,
+            )
+            record.state2 = self.model.predict_model2(
+                record.state2,
+                force_achieved,
+                delta_yaw,
+            )
+            record.force_previous = force_achieved.copy()
+            record.steps += 1
+            self.fusion.observe_position(
+                actual_position=filtered_position,
+                prediction1=record.state1[:3],
+                prediction2=record.state2[:3],
+                horizon_step=record.steps,
+                origin_index=record.origin_index,
+                target_index=self._frame_index,
+            )
+            if record.steps < self.fusion.config.prediction_horizon:
+                retained.append(record)
+        self._pending = retained
+
+    def _start_prediction(self, state: np.ndarray, force_previous: np.ndarray) -> None:
+        self._pending.append(
+            _PendingRotatingPrediction(
+                origin_index=self._frame_index,
+                state1=state.copy(),
+                state2=state.copy(),
+                force_previous=force_previous.copy(),
+            )
+        )
+
+    def update(
+        self,
+        position_body,
+        yaw_rad: float,
+        yaw_rate_rad_s: float,
+        force_achieved_previous,
+        yaw_moment_achieved_previous: float,
+        reference_position=None,
+        roll_pitch_control=(0.0, 0.0),
+    ) -> YawTrackerOutput:
+        force = vector3(force_achieved_previous, "force_achieved_previous")
+        yaw = finite_scalar(yaw_rad, "yaw_rad")
+        yaw_rate = finite_scalar(yaw_rate_rad_s, "yaw_rate_rad_s")
+        yaw_moment = finite_scalar(
+            yaw_moment_achieved_previous, "yaw_moment_achieved_previous"
+        )
+        roll_pitch = np.asarray(roll_pitch_control, dtype=float).reshape(-1)
+        if roll_pitch.shape != (2,) or not np.all(np.isfinite(roll_pitch)):
+            raise ValueError("roll_pitch_control must be finite with shape (2,)")
+
+        self._frame_index += 1
+        if not self.estimator.initialized:
+            state = self.estimator.initialize(position_body)
+            self.fusion.advance_time(self._frame_index)
+        else:
+            if self._yaw_previous is None:
+                raise RuntimeError("previous yaw is unavailable; re-latch or reset tracker")
+            delta_yaw = wrap_angle(yaw - self._yaw_previous)
+            old_state = self.estimator.x.copy()
+            prediction1 = self.model.predict_model1(
+                old_state,
+                force,
+                self._force_before_last,
+                delta_yaw,
+            )
+            prediction2 = self.model.predict_model2(
+                old_state,
+                force,
+                delta_yaw,
+            )
+            weight6 = np.diag(
+                np.concatenate(
+                    (self.fusion.model1_weight, self.fusion.model1_weight)
+                )
+            )
+            fused_prediction = (
+                weight6 @ prediction1 + (np.eye(6) - weight6) @ prediction2
+            )
+            self.estimator.predict_mean(fused_prediction, delta_yaw)
+            state = self.estimator.update(position_body)
+            self._score_completed_predictions(state[:3], force, delta_yaw)
+
+        self._yaw_previous = yaw
+        self._force_before_last = force.copy()
+        self._yaw_moment_before_last = yaw_moment
+        self._start_prediction(state, force)
+        result = self.controller.solve(
+            state=state,
+            yaw_rate=yaw_rate,
+            force_previous=force,
+            yaw_moment_previous=yaw_moment,
+            reference_position=reference_position,
+            model1_weight=self.fusion.model1_weight,
+        )
+        yaw_channel = self.yaw_adapter.convert(result.yaw_moment)
+        attitude_control = (roll_pitch[0], roll_pitch[1], yaw_channel)
+        allocation = (
+            None
+            if self.thruster_allocator is None
+            else self.thruster_allocator.allocate(
+                result.force, attitude_control=attitude_control
+            )
+        )
+        return YawTrackerOutput(
+            estimated_state=state,
+            yaw_rate=yaw_rate,
+            line_of_sight_angle=line_of_sight_angle(state[:3]),
+            yaw_channel=yaw_channel,
+            mpc=result,
+            device_command=self.force_adapter.convert(result.force),
+            thruster_allocation=allocation,
+        )
