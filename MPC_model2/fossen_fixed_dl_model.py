@@ -6,7 +6,7 @@ from typing import Iterable
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.fossen_fixed_dl_model import (
+from MPC_dual_model.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel as _SharedFixedLinearDampingRelativeModel,
     matrix3,
     matrix_exponential,

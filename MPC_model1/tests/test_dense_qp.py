@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from MPC_model1_FineSUB_20260803.dense_qp import (
+from MPC_model1.dense_qp import (
     DenseADMMQPSolver,
     QPSolverSettings,
 )

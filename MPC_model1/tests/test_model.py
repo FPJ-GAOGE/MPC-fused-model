@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from MPC_model1_FineSUB_20260803.fossen_fixed_dl_model import (
+from MPC_model1.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel,
 )
 

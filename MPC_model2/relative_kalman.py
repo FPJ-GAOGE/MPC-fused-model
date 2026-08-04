@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.relative_kalman import (
+from MPC_dual_model.relative_kalman import (
     KalmanConfig,
     RelativePositionKalmanFilter as _SharedRelativePositionKalmanFilter,
 )

@@ -1,7 +1,7 @@
 # 固定线性阻尼模型一 MPC
 
 本目录实现 FineSUB 鱼目标三维相对位置跟踪，并且可以独立运行。坐标系、控制器输入输出、QP 约束、设备命令和八推进器分配格式与
-`MPC_dual_model_FineSUB_20260803` 对齐，但预测、估计和公开接口只包含模型一，不导入融合模型目录，也不计算模型二或融合权重。
+`MPC_dual_model` 对齐，但预测、估计和公开接口只包含模型一，不导入融合模型目录，也不计算模型二或融合权重。
 
 ## 1. 模型一
 
@@ -88,9 +88,9 @@ tau_previous+ = tau
 在 `D:\FINSMCAT\Machine\MPC` 下运行：
 
 ```powershell
-python -m pip install -r MPC_model1_FineSUB_20260803/requirements.txt
-python -m unittest discover -s MPC_model1_FineSUB_20260803/tests -v
-python -m MPC_model1_FineSUB_20260803.example_simulation
+python -m pip install -r MPC_model1/requirements.txt
+python -m unittest discover -s MPC_model1/tests -v
+python -m MPC_model1.example_simulation
 ```
 
 也可以进入本目录后直接运行 `python example_simulation.py`。
@@ -100,7 +100,7 @@ python -m MPC_model1_FineSUB_20260803.example_simulation
 ```python
 import numpy as np
 
-from MPC_model1_FineSUB_20260803.live_integration_example import (
+from MPC_model1.live_integration_example import (
     build_tracker,
     one_control_update,
 )

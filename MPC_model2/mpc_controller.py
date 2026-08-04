@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.mpc_controller import (
+from MPC_dual_model.mpc_controller import (
     MPCConfig,
     RelativeMPCController as _SharedQPController,
 )

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.device_adapter import (
+from MPC_dual_model.device_adapter import (
     DeviceCommand,
     FineSUBThrusterAllocator,
     ForceCommandAdapter,

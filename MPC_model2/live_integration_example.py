@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.camera_transform import camera_to_body_position
-from MPC_dual_model_FineSUB_20260803.device_adapter import (
+from MPC_dual_model.camera_transform import camera_to_body_position
+from MPC_dual_model.device_adapter import (
     FineSUBThrusterAllocator,
     ForceCommandAdapter,
 )

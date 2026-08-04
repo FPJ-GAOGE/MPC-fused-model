@@ -1,6 +1,6 @@
 # FineSUB 模型二 MPC
 
-本目录是 `MPC_dual_model_FineSUB_20260803` 的“只使用模型二”版本，并按 `D:\浏览器下载\Untitled (1).pdf` 第 3-8 页整理。它保留固定线性阻尼 Fossen 模型、三轴 MPC 代价、力/力变化率约束、视场与前向距离软约束、相对位置卡尔曼滤波、设备命令映射和 FineSUB 八推进器分配。
+本目录是 `MPC_dual_model` 的“只使用模型二”版本，并按 `D:\浏览器下载\Untitled (1).pdf` 第 3-8 页整理。它保留固定线性阻尼 Fossen 模型、三轴 MPC 代价、力/力变化率约束、视场与前向距离软约束、相对位置卡尔曼滤波、设备命令映射和 FineSUB 八推进器分配。
 
 唯一使用的预测模型是：
 
@@ -30,8 +30,8 @@ x[k+1] = A_d x[k] + B_d tau[k]
 在 `D:\FINSMCAT\Machine\MPC` 下运行：
 
 ```powershell
-python -m unittest discover -s MPC_model2_FineSUB_20260804/tests -v
-python -m MPC_model2_FineSUB_20260804.example_simulation
+python -m unittest discover -s MPC_model2/tests -v
+python -m MPC_model2.example_simulation
 ```
 
 实机接入入口见 `live_integration_example.py`。上机前必须重新标定 `M_t`、`D_L`、力与命令的比例、符号、相机外参、噪声和全部限幅。MCU 高层混控与 Python 八推进器直控只能选择一种，不能重复分配。

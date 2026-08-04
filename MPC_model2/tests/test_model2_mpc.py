@@ -2,19 +2,19 @@ import unittest
 
 import numpy as np
 
-from MPC_dual_model_FineSUB_20260803.device_adapter import (
+from MPC_dual_model.device_adapter import (
     FineSUBThrusterAllocator,
     ForceCommandAdapter,
 )
-from MPC_model2_FineSUB_20260804.fossen_fixed_dl_model import (
+from MPC_model2.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel,
 )
-from MPC_model2_FineSUB_20260804.mpc_controller import (
+from MPC_model2.mpc_controller import (
     MPCConfig,
     RelativeMPCController,
 )
-from MPC_model2_FineSUB_20260804.mpc_tracker import MPCTracker
-from MPC_model2_FineSUB_20260804.relative_kalman import (
+from MPC_model2.mpc_tracker import MPCTracker
+from MPC_model2.relative_kalman import (
     RelativePositionKalmanFilter,
 )
 
