@@ -50,8 +50,8 @@ class MPCConfig:
     velocity_weights: object = (8.0, 12.0, 12.0)
     terminal_weight_scale: float = 4.0
     # Penalizes the fused model's effective input:
-    # tau[k] - diag(a1) tau[k-1].  It becomes delta-force for model 1 and
-    # absolute force for model 2, avoiding a bias against nonzero hold force.
+    # tau[k] - diag(a1) tau_base. It is relative-to-baseline force for model 1
+    # and absolute force for model 2, avoiding a bias against nonzero hold force.
     force_weights: object = (0.04, 0.06, 0.06)
     delta_force_weights: object = (0.8, 1.0, 1.0)
 
@@ -59,6 +59,15 @@ class MPCConfig:
     force_max: object = (20.0, 15.0, 15.0)
     delta_force_min: object = (-4.0, -3.0, -3.0)
     delta_force_max: object = (4.0, 3.0, 3.0)
+
+    # Optional per-thruster map. Each row maps body force [forward,right,down]
+    # to one thruster value. Bounds may be asymmetric and use the same unit as
+    # the mapped value (normally newtons). The scalar limit remains as a
+    # backward-compatible symmetric default.
+    thruster_command_matrix: object | None = None
+    thruster_command_limit: float = 1.0
+    thruster_command_min: object | None = None
+    thruster_command_max: object | None = None
 
     forward_distance_min: float = 0.25
     forward_distance_max: float = 1.50
@@ -105,6 +114,41 @@ class MPCConfig:
         self.force_max = vector3(self.force_max, "force_max")
         self.delta_force_min = vector3(self.delta_force_min, "delta_force_min")
         self.delta_force_max = vector3(self.delta_force_max, "delta_force_max")
+        if self.thruster_command_matrix is not None:
+            matrix = np.asarray(self.thruster_command_matrix, dtype=float)
+            if (
+                matrix.ndim != 2
+                or matrix.shape[1] != 3
+                or matrix.shape[0] < 1
+                or not np.all(np.isfinite(matrix))
+            ):
+                raise ValueError("thruster_command_matrix must have shape (n, 3)")
+            self.thruster_command_matrix = matrix
+        if self.thruster_command_limit <= 0.0 or not np.isfinite(
+            self.thruster_command_limit
+        ):
+            raise ValueError("thruster_command_limit must be positive and finite")
+        if self.thruster_command_matrix is None:
+            if self.thruster_command_min is not None or self.thruster_command_max is not None:
+                raise ValueError("thruster bounds require thruster_command_matrix")
+        else:
+            row_count = self.thruster_command_matrix.shape[0]
+            self.thruster_command_min = self._normalize_thruster_bound(
+                self.thruster_command_min,
+                -self.thruster_command_limit,
+                row_count,
+                "thruster_command_min",
+            )
+            self.thruster_command_max = self._normalize_thruster_bound(
+                self.thruster_command_max,
+                self.thruster_command_limit,
+                row_count,
+                "thruster_command_max",
+            )
+            if np.any(self.thruster_command_min >= 0.0) or np.any(
+                self.thruster_command_max <= 0.0
+            ):
+                raise ValueError("each thruster interval must contain zero")
         if np.any(self.force_min >= self.force_max):
             raise ValueError("force_min must be smaller than force_max")
         if np.any(self.delta_force_min >= self.delta_force_max):
@@ -125,6 +169,15 @@ class MPCConfig:
         if axes != {0, 1, 2}:
             raise ValueError("forward/horizontal/vertical axes must be a permutation of 0,1,2")
         return self
+
+    @staticmethod
+    def _normalize_thruster_bound(value, default: float, size: int, name: str) -> Array:
+        if value is None:
+            return np.full(size, default, dtype=float)
+        result = np.asarray(value, dtype=float).reshape(-1)
+        if result.shape != (size,) or not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must contain {size} finite values")
+        return result
 
 
 @dataclass
@@ -178,11 +231,13 @@ class RelativeMPCController:
         """Build predictions for the two-model, rolling-force formulation.
 
         The augmented state is z=[x, tau_previous].  With W containing the
-        per-axis model-1 weights, the fused physical-state equation is
+        per-axis model-1 weights, and tau_base treated as a model-1-only
+        baseline input, the fused physical-state equation is
 
-            x+ = A_d x + B_d tau - W B_d tau_previous.
+            x+ = A_d x + B_d tau - W B_d tau_base.
 
-        a1=1 is model 1 and a1=0 is model 2.
+        a1=1 is the baseline-relative model and a1=0 is the absolute-force
+        model. tau_previous remains in z only for force-rate constraints.
         """
         weight = np.clip(vector3(model1_weight, "model1_weight"), 0.0, 1.0)
         if self._prediction_weight is not None and np.allclose(
@@ -195,9 +250,10 @@ class RelativeMPCController:
         A = np.zeros((9, 9))
         B = np.zeros((9, 3))
         A[:6, :6] = physical_A
-        A[:6, 6:] = -W @ physical_B
         B[:6] = physical_B
         B[6:] = np.eye(3)
+        baseline_transition = np.zeros((9, 3))
+        baseline_transition[:6] = -W @ physical_B
         output = np.hstack((np.eye(6), np.zeros((6, 3))))
         N = self.config.horizon
         nz, nu = A.shape[0], B.shape[1]
@@ -216,24 +272,30 @@ class RelativeMPCController:
                     j * nu : (j + 1) * nu,
                 ] = output @ powers[i - j] @ B
 
+        # Constant baseline contribution for each prediction stage. The
+        # baseline is supplied at solve time, so this remains affine and the
+        # QP stays linear.
+        self.baseline_effect_matrix = np.zeros((N * nx, 3))
+        for i in range(N):
+            accumulated = np.zeros((6, 3))
+            for j in range(i + 1):
+                accumulated += output @ powers[j] @ baseline_transition
+            self.baseline_effect_matrix[
+                i * nx : (i + 1) * nx
+            ] = accumulated
+
         self.rate_matrix = np.zeros((N * nu, N * nu))
         self.effective_force_matrix = np.zeros((N * nu, N * nu))
-        input_weight = np.diag(weight)
+        # The effective model-1/model-2 input is tau - W*tau_base. The
+        # previous force is only used by the separate rate penalty.
+        self.effective_force_matrix = np.eye(N * nu)
         for i in range(N):
             self.rate_matrix[i * nu : (i + 1) * nu, i * nu : (i + 1) * nu] = np.eye(nu)
-            self.effective_force_matrix[
-                i * nu : (i + 1) * nu,
-                i * nu : (i + 1) * nu,
-            ] = np.eye(nu)
             if i > 0:
                 self.rate_matrix[
                     i * nu : (i + 1) * nu,
                     (i - 1) * nu : i * nu,
                 ] = -np.eye(nu)
-                self.effective_force_matrix[
-                    i * nu : (i + 1) * nu,
-                    (i - 1) * nu : i * nu,
-                ] = -input_weight
         self._prediction_weight = weight.copy()
 
     def _reference_stack(self, reference_position: Array) -> Array:
@@ -245,6 +307,7 @@ class RelativeMPCController:
         free_prediction: Array,
         reference_position: Array,
         tau_previous: Array,
+        tau_base: Array,
     ) -> tuple[Array, Array]:
         cfg = self.config
         N = cfg.horizon
@@ -260,8 +323,8 @@ class RelativeMPCController:
         error_free = free_prediction - reference
         rate_reference = np.zeros(3 * N)
         rate_reference[:3] = tau_previous
-        effective_force_reference = np.zeros(3 * N)
-        effective_force_reference[:3] = self._prediction_weight * tau_previous
+        input_weight = np.diag(self._prediction_weight)
+        effective_force_reference = np.tile(input_weight @ tau_base, N)
 
         P_force = 2.0 * (
             self.Su.T @ Q_bar @ self.Su
@@ -314,6 +377,19 @@ class RelativeMPCController:
             row[index] = 1.0
             axis = index % 3
             append_row(row, cfg.force_min[axis], cfg.force_max[axis])
+
+        # Couple force axes through the real per-thruster command limits.
+        if cfg.thruster_command_matrix is not None:
+            for step in range(N):
+                force_start = 3 * step
+                for row_index, command_row in enumerate(cfg.thruster_command_matrix):
+                    row = np.zeros(n_variable)
+                    row[force_start : force_start + 3] = command_row
+                    append_row(
+                        row,
+                        cfg.thruster_command_min[row_index],
+                        cfg.thruster_command_max[row_index],
+                    )
 
         # Force-rate limits. First difference is tau[0] - tau_previous.
         for index in range(n_force):
@@ -415,7 +491,41 @@ class RelativeMPCController:
         previous = np.clip(tau_previous, cfg.force_min, cfg.force_max)
         low = np.maximum(cfg.force_min, previous + cfg.delta_force_min)
         high = np.minimum(cfg.force_max, previous + cfg.delta_force_max)
-        return np.minimum(np.maximum(tau_base, low), high)
+        force = np.minimum(np.maximum(tau_base, low), high)
+        if cfg.thruster_command_matrix is None:
+            return force
+
+        # Alternating projections keep the safety fallback inside both the
+        # per-axis/rate box and the joint thruster envelope.
+        for _ in range(8):
+            force = np.minimum(np.maximum(force, low), high)
+            for row_index, command_row in enumerate(cfg.thruster_command_matrix):
+                value = float(command_row @ force)
+                lower_bound = cfg.thruster_command_min[row_index]
+                upper_bound = cfg.thruster_command_max[row_index]
+                norm_sq = max(
+                    float(command_row @ command_row), np.finfo(float).eps
+                )
+                if value > upper_bound:
+                    force -= (value - upper_bound) / norm_sq * command_row
+                elif value < lower_bound:
+                    force += (lower_bound - value) / norm_sq * command_row
+        return np.minimum(np.maximum(force, low), high)
+
+    def thruster_utilization(self, force, row_indices=None) -> float:
+        """Return largest direction-aware utilization for a body force."""
+        if self.config.thruster_command_matrix is None:
+            return 0.0
+        values = self.config.thruster_command_matrix @ vector3(force, "force")
+        lower = self.config.thruster_command_min
+        upper = self.config.thruster_command_max
+        if row_indices is not None:
+            indices = np.asarray(row_indices, dtype=int).reshape(-1)
+            values = values[indices]
+            lower = lower[indices]
+            upper = upper[indices]
+        scales = np.where(values >= 0.0, upper, -lower)
+        return float(np.max(np.abs(values) / scales))
 
     def solve(
         self,
@@ -429,13 +539,15 @@ class RelativeMPCController:
         if state.shape != (6,) or not np.all(np.isfinite(state)):
             raise ValueError("state must be [p_rel(3), v_rel(3)]")
         tau_previous = vector3(tau_previous, "tau_previous")
-        # The rolling previous force drives model 1.  The separately latched
-        # baseline is reserved for a safe optimizer-failure fallback.
+        # tau_base is a model-1-only baseline and is also the safe fallback
+        # target. It is multiplied by the model-1 weight; model 2 sees zero
+        # baseline contribution.
         fallback_baseline = (
             self.model.tau_base
             if tau_base is None
             else vector3(tau_base, "tau_base")
         )
+        baseline = fallback_baseline.copy()
         weight1 = (
             np.ones(3)
             if model1_weight is None
@@ -449,8 +561,13 @@ class RelativeMPCController:
         )
 
         augmented_state = np.concatenate((state, tau_previous))
-        free_prediction = self.Sx @ augmented_state
-        P, q = self._cost(free_prediction, reference, tau_previous)
+        free_prediction = (
+            self.Sx @ augmented_state
+            + self.baseline_effect_matrix @ baseline
+        )
+        P, q = self._cost(
+            free_prediction, reference, tau_previous, baseline
+        )
         constraint_matrix, lower, upper = self._constraints(
             free_prediction, tau_previous
         )
@@ -483,6 +600,10 @@ class RelativeMPCController:
                 tau_previous + self.config.delta_force_max,
             )
             force = np.minimum(np.maximum(force_sequence[0], low), high)
+            if self.config.thruster_command_matrix is not None:
+                # The QP already enforces this.  The projection only removes
+                # numerical solver residuals introduced by the final clip.
+                force = self._safe_fallback(tau_previous, force)
             self._warm_start = self._shift_warm_start(decision)
             self._last_feasible_force = force.copy()
             used_fallback = False
@@ -503,6 +624,7 @@ class RelativeMPCController:
 
         predicted = (
             self.Sx @ augmented_state
+            + self.baseline_effect_matrix @ baseline
             + self.Su @ force_sequence.ravel()
         ).reshape(N, 6)
         return MPCResult(

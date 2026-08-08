@@ -18,7 +18,10 @@ from MPC_dual_model.model_fusion import (
 from MPC_dual_model_yaw.yaw_kalman import (
     RotationAwareKalmanFilter,
 )
-from MPC_dual_model_yaw.live_integration_example import one_control_update
+from MPC_dual_model_yaw.live_integration_example import (
+    build_tracker as build_live_tracker,
+    one_control_update,
+)
 from MPC_dual_model_yaw.yaw_controller import (
     YawControlConfig,
     YawStateController,
@@ -104,6 +107,53 @@ class YawTrackerTest(unittest.TestCase):
         self.assertEqual(
             fusion.config.prediction_horizon_weights,
             DEFAULT_PREDICTION_HORIZON_WEIGHTS,
+        )
+
+    def test_live_builder_matches_tuned_translation_baseline(self) -> None:
+        tracker = build_live_tracker()
+        config = tracker.controller.config
+        np.testing.assert_allclose(config.position_weights, (10000, 14000, 25000))
+        np.testing.assert_allclose(config.velocity_weights, (2, 20, 12))
+        np.testing.assert_allclose(config.force_weights, (0.003, 0.002, 0.04))
+        np.testing.assert_allclose(config.delta_force_weights, (0.01, 0.01, 0.5))
+        np.testing.assert_allclose(
+            config.force_min,
+            (-16.2968314073626, -16.2968314073626, -23.0472),
+        )
+        np.testing.assert_allclose(
+            config.force_max,
+            (16.2968314073626, 16.2968314073626, 29.5236),
+        )
+        self.assertTrue(tracker.baseline_adaptation.enabled)
+        self.assertEqual(tracker.baseline_adaptation.update_mode, "gated_ema")
+
+    def test_live_baseline_updates_each_eligible_axis(self) -> None:
+        tracker = build_live_tracker()
+        output = tracker.update(
+            position_body=tracker.controller.config.reference_position,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            force_achieved_previous=(5.0, -2.0, 1.0),
+            yaw_moment_achieved_previous=0.0,
+        )
+        np.testing.assert_allclose(
+            tracker.model.translation.tau_base,
+            (0.05, -0.02, 0.01),
+        )
+        self.assertLessEqual(
+            tracker.controller.thruster_utilization(output.mpc.force),
+            1.0 + 1.0e-8,
+        )
+
+    def test_live_fallback_respects_asymmetric_thruster_envelope(self) -> None:
+        tracker = build_live_tracker()
+        force = tracker.controller._safe_fallback(
+            np.zeros(3),
+            np.array([100.0, 100.0, 100.0]),
+        )
+        self.assertLessEqual(
+            tracker.controller.thruster_utilization(force),
+            1.0 + 1.0e-10,
         )
 
     def test_rotating_tracker_keeps_and_masks_exact_staircase_cells(self) -> None:

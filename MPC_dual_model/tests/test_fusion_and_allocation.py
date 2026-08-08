@@ -22,6 +22,42 @@ class FusionAndAllocationTest(unittest.TestCase):
         np.testing.assert_allclose(weight, np.full(3, 0.95))
         self.assertTrue(np.allclose(fusion.model1_weight + fusion.model2_weight, 1.0))
 
+    def test_small_steady_residuals_are_not_hidden_by_epsilon(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                epsilon=1.0e-10,
+                minimum_weight=0.05,
+                initial_model1_weight=(0.8, 0.8, 0.8),
+            )
+        )
+        weight = fusion.observe_position(
+            actual_position=(0.0, 0.0, 0.0),
+            prediction1=(0.0, 0.0, 0.0),
+            prediction2=(0.001, 0.0, 0.0),
+            horizon_step=1,
+        )
+        # A 1e-6 m2 candidate difference must still select model 1. A 1e-5
+        # regularizer would incorrectly pull this result toward 0.5.
+        self.assertAlmostEqual(weight[0], 0.95)
+
+    def test_noise_scale_difference_keeps_previous_model_preference(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                initial_model1_weight=(0.8, 0.8, 0.8),
+                minimum_weight=0.01,
+                indistinguishable_score_threshold=(1.0e-7, 1.0e-7, 1.0e-7),
+            )
+        )
+        weight = fusion.observe_position(
+            actual_position=(0.0, 0.0, 0.0),
+            prediction1=(0.0, 0.0, 0.0),
+            prediction2=(1.0e-4, 1.0e-4, 1.0e-4),
+            horizon_step=1,
+        )
+        # A 0.1 mm candidate difference is below the configured score floor;
+        # neutral evidence recovers toward the model-1 steady-state prior.
+        np.testing.assert_allclose(weight, (0.99, 0.99, 0.99))
+
     def test_position_history_keeps_completed_multi_step_scores(self) -> None:
         fusion = OnlineModelFusion(
             FusionConfig(
@@ -42,7 +78,25 @@ class FusionAndAllocationTest(unittest.TestCase):
         # Only x differs between the two candidate predictions.  Identical
         # y/z candidates are intentionally neutral rather than favouring one.
         self.assertGreater(fusion.model1_weight[0], fusion.model2_weight[0])
-        np.testing.assert_allclose(fusion.model1_weight[1:], (0.5, 0.5))
+        # Identical candidates use the model-1 steady-state prior rather than
+        # drifting toward an arbitrary 50/50 split.
+        np.testing.assert_allclose(fusion.model1_weight[1:], (0.95, 0.95))
+
+    def test_default_staircase_can_reach_ninety_nine_percent_model1(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                minimum_weight=0.01,
+                weight_update_rate=1.0,
+                initial_model1_weight=(0.8, 0.8, 0.8),
+            )
+        )
+        weight = fusion.observe_position(
+            actual_position=(0.0, 0.0, 0.0),
+            prediction1=(0.0, 0.0, 0.0),
+            prediction2=(0.5, -0.4, 0.3),
+            horizon_step=1,
+        )
+        np.testing.assert_allclose(weight, (0.99, 0.99, 0.99))
 
     def test_staircase_history_masks_old_origin_long_prediction(self) -> None:
         fusion = OnlineModelFusion(
@@ -70,7 +124,7 @@ class FusionAndAllocationTest(unittest.TestCase):
         self.assertEqual(fusion.sample_count, 2)
         self.assertGreater(fusion.model1_weight[0], fusion.model2_weight[0])
 
-    def test_augmented_prediction_has_rolling_previous_force(self) -> None:
+    def test_augmented_prediction_has_model1_baseline_offset(self) -> None:
         model = FixedLinearDampingRelativeModel(
             np.diag([20.0, 25.0, 30.0]),
             np.diag([8.0, 10.0, 12.0]),
@@ -78,12 +132,71 @@ class FusionAndAllocationTest(unittest.TestCase):
         )
         controller = RelativeMPCController(model, MPCConfig(horizon=2))
         z0 = np.concatenate((np.zeros(6), np.array([2.0, 0.0, 0.0])))
+        baseline = np.array([2.0, 0.0, 0.0])
         controller._build_prediction_matrices(np.ones(3))
-        model1_free = (controller.Sx @ z0).reshape(2, 6)[0]
+        model1_free = (
+            controller.Sx @ z0 + controller.baseline_effect_matrix @ baseline
+        ).reshape(2, 6)[0]
         controller._build_prediction_matrices(np.zeros(3))
-        model2_free = (controller.Sx @ z0).reshape(2, 6)[0]
+        model2_free = (
+            controller.Sx @ z0 + controller.baseline_effect_matrix @ baseline
+        ).reshape(2, 6)[0]
         np.testing.assert_allclose(model1_free, -model.B_d @ [2.0, 0.0, 0.0])
         np.testing.assert_allclose(model2_free, np.zeros(6))
+
+    def test_model2_uses_absolute_force_without_tau_base(self) -> None:
+        model = FixedLinearDampingRelativeModel(
+            np.diag([26.0, 27.0, 26.0]),
+            np.diag([94.0, 144.0, 281.0]),
+            0.05,
+        )
+        controller = RelativeMPCController(model, MPCConfig(horizon=3))
+        baseline = np.array([11.25, -2.0, 1.9])
+        augmented = np.concatenate((np.zeros(6), np.zeros(3)))
+        commands = np.tile(baseline, controller.config.horizon)
+
+        controller._build_prediction_matrices((0.0, 0.0, 0.0))
+        predicted = (controller.Sx @ augmented + controller.Su @ commands).reshape(
+            controller.config.horizon, 6
+        )
+
+        np.testing.assert_allclose(
+            predicted[0],
+            model.A_d @ np.zeros(6) + model.B_d @ baseline,
+            atol=1e-12,
+        )
+
+    def test_diagonal_horizontal_force_hits_joint_thruster_limit(self) -> None:
+        from device_adapter import (
+            FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+            FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+            finesub_translation_thruster_force_matrix,
+        )
+
+        matrix = finesub_translation_thruster_force_matrix()
+        positive = np.asarray(FINESUB_V4_PRO1_FORCE_POSITIVE_N)
+        negative = np.asarray(FINESUB_V4_PRO1_FORCE_NEGATIVE_N)
+        single_axis = matrix @ np.array([16.2968314073626, 0.0, 0.0])
+        diagonal = matrix @ np.array([16.2968314073626, 16.2968314073626, 0.0])
+        self.assertTrue(np.all(single_axis <= positive + 1e-12))
+        self.assertTrue(np.all(single_axis >= -negative - 1e-12))
+        self.assertTrue(
+            np.any((diagonal > positive + 1e-12) | (diagonal < -negative - 1e-12))
+        )
+
+    def test_canonical_translation_force_matrix_order_and_signs(self) -> None:
+        from device_adapter import finesub_translation_thruster_force_matrix
+
+        matrix = finesub_translation_thruster_force_matrix()
+        np.testing.assert_allclose(matrix[:4, :2], np.zeros((4, 2)))
+        np.testing.assert_allclose(matrix[:4, 2], np.full(4, 0.25))
+        expected_signs = np.array(
+            [[1.0, 1.0], [1.0, -1.0], [-1.0, -1.0], [-1.0, 1.0]]
+        )
+        np.testing.assert_allclose(
+            np.sign(matrix[4:, :2]),
+            expected_signs,
+        )
 
     def test_effective_force_cost_matches_each_candidate_model(self) -> None:
         model = FixedLinearDampingRelativeModel(
@@ -94,10 +207,7 @@ class FusionAndAllocationTest(unittest.TestCase):
         controller = RelativeMPCController(model, MPCConfig(horizon=3))
 
         controller._build_prediction_matrices(np.ones(3))
-        np.testing.assert_allclose(
-            controller.effective_force_matrix,
-            controller.rate_matrix,
-        )
+        np.testing.assert_allclose(controller.effective_force_matrix, np.eye(9))
 
         controller._build_prediction_matrices(np.zeros(3))
         np.testing.assert_allclose(

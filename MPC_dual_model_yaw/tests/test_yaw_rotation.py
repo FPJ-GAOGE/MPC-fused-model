@@ -57,6 +57,24 @@ class RotationModelTest(unittest.TestCase):
         actual = model.predict_model2(state, force, delta_yaw_rad=0.0)
         np.testing.assert_allclose(actual, expected, atol=1.0e-12)
 
+    def test_model1_subtracts_tau_base_instead_of_previous_force(self) -> None:
+        _, model = self.build()
+        state = np.array([1.0, 0.2, -0.1, 0.1, -0.03, 0.02])
+        force = np.array([3.0, -1.0, 0.5])
+        tau_base = np.array([1.2, 0.4, -0.2])
+        expected = model.predict_translation(
+            state,
+            force - tau_base,
+            delta_yaw_rad=0.03,
+        )
+        actual = model.predict_model1(
+            state,
+            force,
+            tau_base,
+            delta_yaw_rad=0.03,
+        )
+        np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
     def test_yaw_step_uses_trapezoidal_integration(self) -> None:
         _, model = self.build()
         psi_next, omega_next, delta = model.yaw.predict_yaw_step(0.2, 0.1, 0.4)

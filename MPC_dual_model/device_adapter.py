@@ -12,6 +12,132 @@ except ImportError:
     from fossen_fixed_dl_model import vector3
 
 
+FINESUB_CANONICAL_THRUSTERS = (
+    "V_LF",
+    "V_LB",
+    "V_RB",
+    "V_RF",
+    "H_LF",
+    "H_LB",
+    "H_RB",
+    "H_RF",
+)
+FINESUB_V4_PRO1_FORCE_POSITIVE_N = (
+    8.4749,
+    7.3809,
+    7.3809,
+    8.4749,
+    7.3809,
+    8.4749,
+    7.3809,
+    8.4749,
+)
+FINESUB_V4_PRO1_FORCE_NEGATIVE_N = (
+    7.9750,
+    5.7618,
+    5.7618,
+    7.9750,
+    5.7618,
+    7.9750,
+    5.7618,
+    7.9750,
+)
+
+
+def finesub_translation_thruster_force_matrix() -> np.ndarray:
+    """Map body translation force to canonical per-thruster force in N.
+
+    The axis order is body forward/right/down. Vertical force is shared
+    equally. The four horizontal thrusters are mounted at 45 degrees, so the
+    minimum-norm pure-translation allocation uses 1/(2*sqrt(2)).
+    """
+    horizontal_gain = 1.0 / (2.0 * np.sqrt(2.0))
+    return np.array(
+        [
+            [0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.25],
+            [horizontal_gain, horizontal_gain, 0.0],
+            [horizontal_gain, -horizontal_gain, 0.0],
+            [-horizontal_gain, -horizontal_gain, 0.0],
+            [-horizontal_gain, horizontal_gain, 0.0],
+        ],
+        dtype=float,
+    )
+
+
+def finesub_translation_force_bounds(
+    force_positive_n: object = FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+    force_negative_n: object = FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return conservative independent FRD bounds for the canonical mixer.
+
+    The QP also applies every per-thruster row, so these axis bounds are only
+    the exact feasible intervals when the other two requested axes are zero.
+    """
+    matrix = finesub_translation_thruster_force_matrix()
+    positive = np.asarray(force_positive_n, dtype=float).reshape(-1)
+    negative = np.asarray(force_negative_n, dtype=float).reshape(-1)
+    if positive.shape != (8,) or negative.shape != (8,):
+        raise ValueError("force_positive_n and force_negative_n must contain 8 values")
+    if (
+        not np.all(np.isfinite(positive))
+        or not np.all(np.isfinite(negative))
+        or np.any(positive <= 0.0)
+        or np.any(negative <= 0.0)
+    ):
+        raise ValueError("per-thruster force limits must be positive and finite")
+
+    lower = np.full(3, -np.inf)
+    upper = np.full(3, np.inf)
+    for axis in range(3):
+        for coefficient, positive_limit, negative_limit in zip(
+            matrix[:, axis], positive, negative
+        ):
+            if abs(coefficient) <= np.finfo(float).eps:
+                continue
+            row_lower = -negative_limit
+            row_upper = positive_limit
+            if coefficient > 0.0:
+                lower[axis] = max(lower[axis], row_lower / coefficient)
+                upper[axis] = min(upper[axis], row_upper / coefficient)
+            else:
+                lower[axis] = max(lower[axis], row_upper / coefficient)
+                upper[axis] = min(upper[axis], row_lower / coefficient)
+    return lower, upper
+
+
+def finesub_translation_command_matrix(
+    force_limits: object = (19.799, 19.799, 28.0),
+) -> np.ndarray:
+    """Return the physical translation envelope for the eight FineSUB motors.
+
+    The four lower motors are horizontal and mounted at 45 degrees.  Their
+    normalized commands are the signed combinations of forward and right
+    force, so diagonal force requests consume both components of the same
+    motors.  The four upper motors provide depth independently.  The matrix
+    follows the motor order documented by :class:`FineSUBThrusterAllocator`.
+    """
+    limits = vector3(force_limits, "force_limits")
+    if np.any(limits <= 0.0):
+        raise ValueError("force_limits must be positive")
+    forward, right, down = limits
+    return np.array(
+        [
+            [-1.0 / forward, 1.0 / right, 0.0],
+            [0.0, 0.0, -1.0 / down],
+            [0.0, 0.0, 1.0 / down],
+            [-1.0 / forward, -1.0 / right, 0.0],
+            [1.0 / forward, -1.0 / right, 0.0],
+            [0.0, 0.0, -1.0 / down],
+            [0.0, 0.0, -1.0 / down],
+            [1.0 / forward, 1.0 / right, 0.0],
+        ],
+        dtype=float,
+    )
+
+
 @dataclass(frozen=True)
 class DeviceCommand:
     planar_forward: int

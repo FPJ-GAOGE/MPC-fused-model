@@ -42,10 +42,11 @@ def build_default_staircase_fusion() -> OnlineModelFusion:
             window=len(DEFAULT_STAIRCASE_HORIZON_CAPS),
             prediction_horizon=len(DEFAULT_PREDICTION_HORIZON_WEIGHTS),
             forgetting_factor=0.8,
+            weight_update_rate=0.35,
             prediction_horizon_weights=DEFAULT_PREDICTION_HORIZON_WEIGHTS,
             staircase_horizon_caps=DEFAULT_STAIRCASE_HORIZON_CAPS,
             initial_model1_weight=(0.80, 0.80, 0.80),
-            minimum_weight=0.05,
+            minimum_weight=0.01,
         )
     )
 
@@ -67,10 +68,14 @@ class SafeControlOutput:
 
 @dataclass
 class BaselineAdaptationConfig:
-    """Optional slow baseline learning, active only near the matched state."""
+    """Optional slow baseline learning from observable quasi-steady motion."""
 
     enabled: bool = False
+    update_mode: str = "gated_ema"
     adaptation_rate: float = 0.02
+    transient_adaptation_rate: float | None = None
+    steady_position_error_tolerance: float = 0.03
+    steady_velocity_tolerance: float = 0.02
     position_error_tolerance: float = 0.06
     velocity_tolerance: float = 0.04
 
@@ -82,7 +87,7 @@ class _PendingPositionPrediction:
     origin_index: int
     state1: np.ndarray
     state2: np.ndarray
-    tau_previous: np.ndarray
+    tau_base: np.ndarray
     steps: int = 0
 
 
@@ -108,15 +113,13 @@ class MPCTracker:
         self.fusion = fusion or build_default_staircase_fusion()
         self.thruster_allocator = thruster_allocator
         self.baseline_adaptation = baseline_adaptation or BaselineAdaptationConfig()
-        self._tau_before_last = np.zeros(3)
         self._pending_position_predictions: deque[_PendingPositionPrediction] = deque()
         self._frame_index = -1
 
     def latch_baseline(self, tau_achieved) -> None:
-        """Initialize rolling force history when automatic tracking is enabled."""
+        """Initialize the baseline and optimizer history for auto tracking."""
         achieved = vector3(tau_achieved, "tau_achieved")
         self.model.set_tau_base(achieved)  # retained only for target-lost fallback
-        self._tau_before_last = achieved.copy()
         self.fusion.reset()
         self.controller.reset()
         self._pending_position_predictions.clear()
@@ -142,21 +145,47 @@ class MPCTracker:
         cfg = self.baseline_adaptation
         if not cfg.enabled:
             return
+        mode = str(cfg.update_mode).strip().lower()
+        if mode == "previous_force":
+            self.model.tau_base = np.clip(
+                tau_achieved,
+                self.controller.config.force_min,
+                self.controller.config.force_max,
+            )
+            return
+        if mode != "gated_ema":
+            raise ValueError(f"unsupported baseline update mode: {cfg.update_mode}")
         reference = (
             self.controller.config.reference_position
             if reference_position is None
             else vector3(reference_position, "reference_position")
         )
-        if (
-            np.linalg.norm(state[:3] - reference) <= cfg.position_error_tolerance
-            and np.linalg.norm(state[3:]) <= cfg.velocity_tolerance
-        ):
-            alpha = float(cfg.adaptation_rate)
-            if not 0.0 < alpha <= 1.0:
-                raise ValueError("baseline adaptation rate must be in (0, 1]")
-            self.model.tau_base = (
-                (1.0 - alpha) * self.model.tau_base + alpha * tau_achieved
-            )
+        steady_alpha = float(cfg.adaptation_rate)
+        transient_alpha = (
+            steady_alpha
+            if cfg.transient_adaptation_rate is None
+            else float(cfg.transient_adaptation_rate)
+        )
+        if not 0.0 < steady_alpha <= 1.0 or not 0.0 < transient_alpha <= 1.0:
+            raise ValueError("baseline adaptation rate must be in (0, 1]")
+
+        # Learn each axis independently. A small vertical estimator residual must
+        # not prevent the forward baseline from following a target reversal.
+        eligible = (
+            np.abs(state[:3] - reference) <= cfg.position_error_tolerance
+        ) & (np.abs(state[3:]) <= cfg.velocity_tolerance)
+        steady = (
+            np.abs(state[:3] - reference)
+            <= cfg.steady_position_error_tolerance
+        ) & (np.abs(state[3:]) <= cfg.steady_velocity_tolerance)
+        alpha = np.where(steady, steady_alpha, transient_alpha)
+        adapted = (1.0 - alpha) * self.model.tau_base + alpha * tau_achieved
+        adapted = np.clip(
+            adapted,
+            self.controller.config.force_min,
+            self.controller.config.force_max,
+        )
+        self.model.tau_base = np.where(eligible, adapted, self.model.tau_base)
 
     def _score_completed_position_predictions(
         self,
@@ -173,13 +202,12 @@ class MPCTracker:
         for record in self._pending_position_predictions:
             record.state1 = (
                 self.model.A_d @ record.state1
-                + self.model.B_d @ (tau_achieved - record.tau_previous)
+                + self.model.B_d @ (tau_achieved - record.tau_base)
             )
             record.state2 = (
                 self.model.A_d @ record.state2
                 + self.model.B_d @ tau_achieved
             )
-            record.tau_previous = tau_achieved.copy()
             record.steps += 1
             self.fusion.observe_position(
                 actual_position=filtered_position,
@@ -193,14 +221,14 @@ class MPCTracker:
                 retained.append(record)
         self._pending_position_predictions = retained
 
-    def _start_position_prediction(self, state: np.ndarray, tau_previous: np.ndarray) -> None:
+    def _start_position_prediction(self, state: np.ndarray, tau_base: np.ndarray) -> None:
         """Save the current posterior as a new multi-step comparison origin."""
         self._pending_position_predictions.append(
             _PendingPositionPrediction(
                 origin_index=self._frame_index,
                 state1=state.copy(),
                 state2=state.copy(),
-                tau_previous=tau_previous.copy(),
+                tau_base=tau_base.copy(),
             )
         )
 
@@ -217,6 +245,9 @@ class MPCTracker:
         prior saturated command as an approximation.
         """
         tau_achieved = vector3(tau_achieved_previous, "tau_achieved_previous")
+        # The baseline used for this interval was learned before the current
+        # measurement arrived. It is observable state, not target feedforward.
+        tau_base_for_interval = self.model.tau_base.copy()
         self._frame_index += 1
         if not self.estimator.initialized:
             state = self.estimator.initialize(position_body)
@@ -225,10 +256,11 @@ class MPCTracker:
             old_state = self.estimator.x.copy()
             prediction1 = (
                 self.model.A_d @ old_state
-                + self.model.B_d @ (tau_achieved - self._tau_before_last)
+                + self.model.B_d @ (tau_achieved - tau_base_for_interval)
             )
             prediction2 = (
-                self.model.A_d @ old_state + self.model.B_d @ tau_achieved
+                self.model.A_d @ old_state
+                + self.model.B_d @ tau_achieved
             )
             weight6 = np.diag(
                 np.concatenate(
@@ -241,9 +273,8 @@ class MPCTracker:
             self.estimator.predict_mean(fused_prediction)
             state = self.estimator.update(position_body)
             self._score_completed_position_predictions(state[:3], tau_achieved)
-        self._tau_before_last = tau_achieved.copy()
         self._adapt_baseline_if_matched(state, tau_achieved, reference_position)
-        self._start_position_prediction(state, tau_achieved)
+        self._start_position_prediction(state, self.model.tau_base)
         result = self.controller.solve(
             state=state,
             tau_previous=tau_achieved,

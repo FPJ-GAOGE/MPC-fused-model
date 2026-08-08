@@ -101,5 +101,35 @@ class YawMPCTest(unittest.TestCase):
             atol=0.0,
         )
 
+    def test_fused_prediction_uses_model1_only_tau_base(self) -> None:
+        model, controller, yaw_controller = self.build()
+        reference = controller.config.reference_position
+        previous = np.array([3.0, -2.0, 1.0])
+        tau_base = np.array([1.0, 0.5, -0.4])
+        weight = np.array([0.8, 0.3, 0.6])
+        yaw_prediction = yaw_controller.update(
+            0.0, 0.0, 0.0, 0.0, controller.config.horizon
+        ).prediction
+        controller._build_prediction_matrices(
+            reference,
+            weight,
+            yaw_prediction,
+            tau_base,
+        )
+        augmented = np.concatenate((np.zeros(6), previous))
+        free = (
+            controller.Sx @ augmented + controller.Sc
+        ).reshape(controller.config.horizon, controller.AUGMENTED_DIM)
+
+        expected_velocity = model.translation.G @ (
+            previous - weight * tau_base
+        )
+        np.testing.assert_allclose(free[0, 3:6], expected_velocity, atol=1.0e-12)
+        np.testing.assert_allclose(
+            free[0, :3],
+            model.dt * expected_velocity,
+            atol=1.0e-12,
+        )
+
 if __name__ == "__main__":
     unittest.main()

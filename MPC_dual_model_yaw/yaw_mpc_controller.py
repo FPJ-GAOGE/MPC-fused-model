@@ -58,6 +58,13 @@ class YawMPCConfig:
     delta_force_min: object = (-4.0, -3.0, -3.0)
     delta_force_max: object = (4.0, 3.0, 3.0)
 
+    # Optional physical per-thruster envelope for the translation force.
+    # Yaw moment remains a separate channel and is not included in this map.
+    thruster_command_matrix: object | None = None
+    thruster_command_limit: float = 1.0
+    thruster_command_min: object | None = None
+    thruster_command_max: object | None = None
+
     forward_distance_min: float = 0.25
     forward_distance_max: float = 1.50
     horizontal_half_fov_deg: float = 42.0
@@ -100,6 +107,44 @@ class YawMPCConfig:
         self.force_max = vector3(self.force_max, "force_max")
         self.delta_force_min = vector3(self.delta_force_min, "delta_force_min")
         self.delta_force_max = vector3(self.delta_force_max, "delta_force_max")
+        if self.thruster_command_matrix is not None:
+            matrix = np.asarray(self.thruster_command_matrix, dtype=float)
+            if (
+                matrix.ndim != 2
+                or matrix.shape[1] != 3
+                or matrix.shape[0] < 1
+                or not np.all(np.isfinite(matrix))
+            ):
+                raise ValueError("thruster_command_matrix must have shape (n, 3)")
+            self.thruster_command_matrix = matrix
+        if self.thruster_command_limit <= 0.0 or not np.isfinite(
+            self.thruster_command_limit
+        ):
+            raise ValueError("thruster_command_limit must be positive and finite")
+        if self.thruster_command_matrix is None:
+            if (
+                self.thruster_command_min is not None
+                or self.thruster_command_max is not None
+            ):
+                raise ValueError("thruster bounds require thruster_command_matrix")
+        else:
+            row_count = self.thruster_command_matrix.shape[0]
+            self.thruster_command_min = self._normalize_thruster_bound(
+                self.thruster_command_min,
+                -self.thruster_command_limit,
+                row_count,
+                "thruster_command_min",
+            )
+            self.thruster_command_max = self._normalize_thruster_bound(
+                self.thruster_command_max,
+                self.thruster_command_limit,
+                row_count,
+                "thruster_command_max",
+            )
+            if np.any(self.thruster_command_min >= 0.0) or np.any(
+                self.thruster_command_max <= 0.0
+            ):
+                raise ValueError("each thruster interval must contain zero")
         if self.force_cost_mode not in {"effective", "absolute"}:
             raise ValueError("force_cost_mode must be 'effective' or 'absolute'")
         if np.any(self.force_min >= self.force_max):
@@ -122,6 +167,20 @@ class YawMPCConfig:
         if self.slack_max <= 0.0:
             raise ValueError("slack_max must be positive")
         return self
+
+    @staticmethod
+    def _normalize_thruster_bound(
+        value,
+        default: float,
+        size: int,
+        name: str,
+    ) -> Array:
+        if value is None:
+            return np.full(size, default, dtype=float)
+        result = np.asarray(value, dtype=float).reshape(-1)
+        if result.shape != (size,) or not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must contain {size} finite values")
+        return result
 
 
 @dataclass
@@ -153,10 +212,10 @@ class YawMPCResult:
 class RotationAwareMPCController:
     """Frozen-rotation LTV MPC with delta-force decision variables.
 
-    The internal state is x=[e, v, tau_previous], where e=p-p_d.  For each
-    frozen R_j and model-2 weight A2, the PDF recursion is
+    The internal state is x=[e, v, tau_previous], where e=p-p_d. For each
+    frozen R_j and model-1 weight W, the maintained recursion is
 
-        v+ = R F v + R G delta_tau + A2 R G tau_previous
+        v+ = R F v + R G tau - W R G tau_base
         e+ = R e + dt v+ + (R-I) p_d
         tau+ = tau_previous + delta_tau.
     """
@@ -211,12 +270,13 @@ class RotationAwareMPCController:
         reference_position: Array,
         model1_weight: Array,
         yaw_prediction: YawPrediction,
+        tau_base: Array,
     ) -> None:
         cfg = self.config
         N = cfg.horizon
         nz = self.AUGMENTED_DIM
         nu = self.INPUT_DIM
-        A2 = np.diag(1.0 - model1_weight)
+        W = np.diag(model1_weight)
         F = self.model.translation.F
         G = self.model.translation.G
         dt = self.model.dt
@@ -230,21 +290,25 @@ class RotationAwareMPCController:
             )
             rotated_F = rotation @ F
             rotated_G = rotation @ G
-            model2_previous_gain = A2 @ rotated_G
+            weighted_baseline_gain = W @ rotated_G
 
             A = np.zeros((nz, nz))
             B = np.zeros((nz, nu))
             c = np.zeros(nz)
             A[:3, :3] = rotation
             A[:3, 3:6] = dt * rotated_F
-            A[:3, 6:9] = dt * model2_previous_gain
+            A[:3, 6:9] = dt * rotated_G
             A[3:6, 3:6] = rotated_F
-            A[3:6, 6:9] = model2_previous_gain
+            A[3:6, 6:9] = rotated_G
             A[6:9, 6:9] = np.eye(3)
             B[:3] = dt * rotated_G
             B[3:6] = rotated_G
             B[6:9] = np.eye(3)
-            c[:3] = (rotation - np.eye(3)) @ reference_position
+            c[:3] = (
+                (rotation - np.eye(3)) @ reference_position
+                - dt * weighted_baseline_gain @ tau_base
+            )
+            c[3:6] = -weighted_baseline_gain @ tau_base
             transitions.append(A)
             inputs.append(B)
             constants.append(c)
@@ -265,23 +329,22 @@ class RotationAwareMPCController:
             self.Su[rows] = input_gain
             self.Sc[rows] = affine
 
-        # g_j = delta_tau_j + A2*tau_{j-1}; this is the fused effective
-        # input and avoids penalizing model 1 merely for nonzero hold force.
+        # tau_j = tau_previous + sum(delta_tau_i). The effective force cost is
+        # tau_j-W*tau_base, matching the maintained translation controller.
         self.effective_force_matrix = np.zeros((3 * N, 3 * N))
-        self.effective_force_offset = np.tile(A2 @ np.zeros(3), N)
         for step in range(N):
             rows = slice(3 * step, 3 * (step + 1))
-            self.effective_force_matrix[rows, 3 * step : 3 * (step + 1)] = np.eye(3)
-            for earlier in range(step):
+            for earlier in range(step + 1):
                 self.effective_force_matrix[
                     rows, 3 * earlier : 3 * (earlier + 1)
-                ] = A2
-        self._A2 = A2
+                ] = np.eye(3)
+        self._model1_weight = W
 
     def _cost(
         self,
         free_prediction: Array,
         force_previous: Array,
+        tau_base: Array,
     ) -> tuple[Array, Array]:
         cfg = self.config
         N = cfg.horizon
@@ -313,7 +376,10 @@ class RotationAwareMPCController:
 
         if cfg.force_cost_mode == "effective":
             R_bar = np.kron(np.eye(N), np.diag(cfg.force_weights))
-            effective_offset = np.tile(self._A2 @ force_previous, N)
+            effective_offset = np.tile(
+                force_previous - self._model1_weight @ tau_base,
+                N,
+            )
             hessian += (
                 self.effective_force_matrix.T
                 @ R_bar
@@ -378,6 +444,26 @@ class RotationAwareMPCController:
                     cfg.force_min[axis] - constant,
                     cfg.force_max[axis] - constant,
                 )
+
+        # Preserve the exact asymmetric V4 Pro1 translation envelope at every
+        # prediction step. Simultaneous yaw usage must be handled later by a
+        # six-DoF allocator because yaw is not a decision variable in this QP.
+        if cfg.thruster_command_matrix is not None:
+            for step in range(N):
+                force_rows = slice(nz * step + 6, nz * step + 9)
+                force_gain = self.Su[force_rows]
+                force_free = free_prediction[force_rows]
+                for row_index, command_row in enumerate(
+                    cfg.thruster_command_matrix
+                ):
+                    row = np.zeros(n_variable)
+                    row[:n_input] = command_row @ force_gain
+                    constant = float(command_row @ force_free)
+                    append_row(
+                        row,
+                        cfg.thruster_command_min[row_index] - constant,
+                        cfg.thruster_command_max[row_index] - constant,
+                    )
 
         for index in range(n_slack):
             row = np.zeros(n_variable)
@@ -459,13 +545,46 @@ class RotationAwareMPCController:
         previous = np.clip(previous, cfg.force_min, cfg.force_max)
         low = np.maximum(cfg.force_min, previous + cfg.delta_force_min)
         high = np.minimum(cfg.force_max, previous + cfg.delta_force_max)
-        return np.minimum(np.maximum(target, low), high)
+        force = np.minimum(np.maximum(target, low), high)
+        if cfg.thruster_command_matrix is None:
+            return force
+
+        for _ in range(8):
+            force = np.minimum(np.maximum(force, low), high)
+            for row_index, command_row in enumerate(cfg.thruster_command_matrix):
+                value = float(command_row @ force)
+                lower_bound = cfg.thruster_command_min[row_index]
+                upper_bound = cfg.thruster_command_max[row_index]
+                norm_sq = max(
+                    float(command_row @ command_row), np.finfo(float).eps
+                )
+                if value > upper_bound:
+                    force -= (value - upper_bound) / norm_sq * command_row
+                elif value < lower_bound:
+                    force += (lower_bound - value) / norm_sq * command_row
+        return np.minimum(np.maximum(force, low), high)
+
+    def thruster_utilization(self, force, row_indices=None) -> float:
+        """Return largest direction-aware translation-thruster utilization."""
+        if self.config.thruster_command_matrix is None:
+            return 0.0
+        values = self.config.thruster_command_matrix @ vector3(force, "force")
+        lower = self.config.thruster_command_min
+        upper = self.config.thruster_command_max
+        if row_indices is not None:
+            indices = np.asarray(row_indices, dtype=int).reshape(-1)
+            values = values[indices]
+            lower = lower[indices]
+            upper = upper[indices]
+        scales = np.where(values >= 0.0, upper, -lower)
+        return float(np.max(np.abs(values) / scales))
 
     def solve(
         self,
         state,
         force_previous,
         yaw_prediction: YawPrediction,
+        tau_base=None,
         reference_position=None,
         model1_weight=None,
         rotation_visibility_from_body=None,
@@ -475,6 +594,11 @@ class RotationAwareMPCController:
         if state.shape != (6,) or not np.all(np.isfinite(state)):
             raise ValueError("state must be [p_rel(3), v_rel(3)]")
         previous = vector3(force_previous, "force_previous")
+        baseline = (
+            self.model.translation.tau_base
+            if tau_base is None
+            else vector3(tau_base, "tau_base")
+        )
         self._validate_yaw_prediction(yaw_prediction)
         reference = (
             self.config.reference_position
@@ -490,10 +614,15 @@ class RotationAwareMPCController:
             rotation_visibility_from_body,
             camera_origin_in_body,
         )
-        self._build_prediction_matrices(reference, weight1, yaw_prediction)
+        self._build_prediction_matrices(
+            reference,
+            weight1,
+            yaw_prediction,
+            baseline,
+        )
         augmented_state = np.concatenate((state[:3] - reference, state[3:], previous))
         free_prediction = self.Sx @ augmented_state + self.Sc
-        P, q = self._cost(free_prediction, previous)
+        P, q = self._cost(free_prediction, previous, baseline)
         constraint_matrix, lower, upper = self._constraints(
             free_prediction,
             reference,
@@ -524,7 +653,12 @@ class RotationAwareMPCController:
                 free_prediction + self.Su @ delta_sequence.ravel()
             ).reshape(N, self.AUGMENTED_DIM)
             force_sequence = predicted_augmented[:, 6:9].copy()
-            force = force_sequence[0].copy()
+            force = self._safe_fallback(previous, force_sequence[0])
+            delta_sequence[0] = force - previous
+            predicted_augmented = (
+                free_prediction + self.Su @ delta_sequence.ravel()
+            ).reshape(N, self.AUGMENTED_DIM)
+            force_sequence = predicted_augmented[:, 6:9].copy()
             force_sequence[0] = force
             self._warm_start = self._shift_warm_start(decision)
             self._last_feasible_force = force.copy()

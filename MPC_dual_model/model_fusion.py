@@ -17,10 +17,12 @@ except ImportError:
 class FusionConfig:
     """Settings for correlated-error least-squares model weights.
 
-    model-1: x+ = A x + B (tau - tau_previous)
+    model-1: x+ = A x + B (tau - tau_base)
     model-2: x+ = A x + B tau
 
     Each axis has an independent model-1 weight a1; model-2 uses 1-a1.
+    ``tau_base`` is held separately by the tracker and is only used in the
+    model-1 branch.
 
     ``window`` is the number of recent prediction start times to retain.
     Each start time generates one position residual for every completed step up
@@ -32,7 +34,19 @@ class FusionConfig:
     prediction_horizon: int = 8
     forgetting_factor: float = 0.92
     horizon_weight_decay: float = 0.95
-    epsilon: float = 1.0e-5
+    # Smooth the estimated model parameter, not the control force. A value of
+    # 1.0 preserves the instantaneous least-squares estimate.
+    weight_update_rate: float = 1.0
+    # Keep the denominator numerically safe without masking small but real
+    # residual differences in the low-noise Unity measurement stream. The
+    # previous 1e-5 m2 value was larger than the observed steady residuals and
+    # pulled the weight toward 0.5 even when model 1 was clearly better.
+    epsilon: float = 1.0e-10
+    # If the two candidates are indistinguishable at the measurement noise
+    # level, there is no evidence for changing the current model preference.
+    # The threshold is per axis because the camera/depth noise is not isotropic.
+    # A scalar remains accepted as a backward-compatible value for all axes.
+    indistinguishable_score_threshold: object = (1.0e-7, 1.0e-7, 1.0e-7)
     minimum_weight: float = 0.05
     initial_model1_weight: object = (0.80, 0.80, 0.80)
     position_error_clip: object = (0.50, 0.50, 0.50)
@@ -55,8 +69,24 @@ class FusionConfig:
             raise ValueError("forgetting_factor must be in (0, 1]")
         if not 0.0 < self.horizon_weight_decay <= 1.0:
             raise ValueError("horizon_weight_decay must be in (0, 1]")
+        if not 0.0 < self.weight_update_rate <= 1.0:
+            raise ValueError("weight_update_rate must be in (0, 1]")
         if self.epsilon <= 0.0:
             raise ValueError("epsilon must be positive")
+        threshold = np.asarray(
+            self.indistinguishable_score_threshold, dtype=float
+        ).reshape(-1)
+        if threshold.size == 1:
+            threshold = np.repeat(threshold, 3)
+        if (
+            threshold.shape != (3,)
+            or not np.all(np.isfinite(threshold))
+            or np.any(threshold < 0.0)
+        ):
+            raise ValueError(
+                "indistinguishable_score_threshold must be a nonnegative scalar or FRD vector"
+            )
+        self.indistinguishable_score_threshold = threshold
         if not 0.0 <= self.minimum_weight < 0.5:
             raise ValueError("minimum_weight must be in [0, 0.5)")
         self.initial_model1_weight = vector3(
@@ -181,8 +211,21 @@ class OnlineModelFusion:
         raw = (self.M2 - self.C12 + self.config.epsilon) / (
             denominator + 2.0 * self.config.epsilon
         )
+        # A nearly zero denominator means the current data cannot distinguish
+        # the two models. Model 1 is the physically preferred neutral model in
+        # this regime because tau_base represents the already-explained
+        # matched-speed equilibrium. Pulling toward its upper bound prevents a
+        # transient reversal from permanently leaving a steady axis on model 2.
+        indistinguishable = denominator <= self.config.indistinguishable_score_threshold
         lower = self.config.minimum_weight
-        self.model1_weight = np.clip(raw, lower, 1.0 - lower)
+        raw = np.where(indistinguishable, 1.0 - lower, raw)
+        raw = np.clip(raw, lower, 1.0 - lower)
+        rate = self.config.weight_update_rate
+        self.model1_weight = np.clip(
+            (1.0 - rate) * self.model1_weight + rate * raw,
+            lower,
+            1.0 - lower,
+        )
         return self.model1_weight.copy()
 
     def advance_time(self, current_index: int) -> np.ndarray:

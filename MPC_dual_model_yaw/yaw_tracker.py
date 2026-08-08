@@ -15,6 +15,7 @@ from MPC_dual_model.device_adapter import (
 )
 from MPC_dual_model.fossen_fixed_dl_model import vector3
 from MPC_dual_model.model_fusion import FusionConfig, OnlineModelFusion
+from MPC_dual_model.mpc_tracker import BaselineAdaptationConfig
 
 from .yaw_kalman import RotationAwareKalmanFilter
 from .yaw_controller import YawControlResult, YawStateController
@@ -40,10 +41,11 @@ def build_default_staircase_fusion() -> OnlineModelFusion:
             window=len(DEFAULT_STAIRCASE_HORIZON_CAPS),
             prediction_horizon=len(DEFAULT_PREDICTION_HORIZON_WEIGHTS),
             forgetting_factor=0.8,
+            weight_update_rate=0.35,
             prediction_horizon_weights=DEFAULT_PREDICTION_HORIZON_WEIGHTS,
             staircase_horizon_caps=DEFAULT_STAIRCASE_HORIZON_CAPS,
             initial_model1_weight=(0.80, 0.80, 0.80),
-            minimum_weight=0.05,
+            minimum_weight=0.01,
         )
     )
 
@@ -107,7 +109,7 @@ class _PendingRotatingPrediction:
     origin_index: int
     state1: np.ndarray
     state2: np.ndarray
-    force_previous: np.ndarray
+    tau_base: np.ndarray
     steps: int = 0
 
 
@@ -130,6 +132,7 @@ class RotationAwareMPCTracker:
         yaw_adapter: YawMomentChannelAdapter,
         fusion: OnlineModelFusion | None = None,
         thruster_allocator: FineSUBThrusterAllocator | None = None,
+        baseline_adaptation: BaselineAdaptationConfig | None = None,
     ) -> None:
         if estimator.model is not model or controller.model is not model:
             raise ValueError("model, estimator.model, and controller.model must match")
@@ -143,7 +146,9 @@ class RotationAwareMPCTracker:
         self.yaw_adapter = yaw_adapter
         self.fusion = fusion or build_default_staircase_fusion()
         self.thruster_allocator = thruster_allocator
-        self._force_before_last = np.zeros(3)
+        self.baseline_adaptation = (
+            baseline_adaptation or BaselineAdaptationConfig()
+        )
         self._yaw_moment_before_last = 0.0
         self._yaw_previous: float | None = None
         self._pending: deque[_PendingRotatingPrediction] = deque()
@@ -159,9 +164,10 @@ class RotationAwareMPCTracker:
         moment = finite_scalar(yaw_moment_achieved, "yaw_moment_achieved")
         self.model.translation.set_tau_base(force)
         self.model.yaw.set_yaw_moment_base(moment)
-        self._force_before_last = force.copy()
         self._yaw_moment_before_last = moment
-        self._yaw_previous = None if yaw_rad is None else finite_scalar(yaw_rad, "yaw_rad")
+        self._yaw_previous = (
+            None if yaw_rad is None else finite_scalar(yaw_rad, "yaw_rad")
+        )
         self.estimator.reset()
         self.fusion.reset()
         self.controller.reset()
@@ -192,7 +198,6 @@ class RotationAwareMPCTracker:
         self.controller.reset()
         self.yaw_controller.reset()
         self._pending.clear()
-        self._force_before_last = achieved_force.copy()
         self._yaw_moment_before_last = achieved_moment
         self._yaw_previous = None
         self._frame_index = -1
@@ -206,6 +211,57 @@ class RotationAwareMPCTracker:
             status="target_lost:return_to_force_and_yaw_baseline",
         )
 
+    def _adapt_baseline_if_matched(
+        self,
+        state: np.ndarray,
+        force_achieved: np.ndarray,
+        reference_position,
+    ) -> None:
+        cfg = self.baseline_adaptation
+        if not cfg.enabled:
+            return
+        mode = str(cfg.update_mode).strip().lower()
+        if mode == "previous_force":
+            self.model.translation.tau_base = np.clip(
+                force_achieved,
+                self.controller.config.force_min,
+                self.controller.config.force_max,
+            )
+            return
+        if mode != "gated_ema":
+            raise ValueError(f"unsupported baseline update mode: {cfg.update_mode}")
+
+        reference = (
+            self.controller.config.reference_position
+            if reference_position is None
+            else vector3(reference_position, "reference_position")
+        )
+        steady_alpha = float(cfg.adaptation_rate)
+        transient_alpha = (
+            steady_alpha
+            if cfg.transient_adaptation_rate is None
+            else float(cfg.transient_adaptation_rate)
+        )
+        if not 0.0 < steady_alpha <= 1.0 or not 0.0 < transient_alpha <= 1.0:
+            raise ValueError("baseline adaptation rate must be in (0, 1]")
+
+        eligible = (
+            np.abs(state[:3] - reference) <= cfg.position_error_tolerance
+        ) & (np.abs(state[3:]) <= cfg.velocity_tolerance)
+        steady = (
+            np.abs(state[:3] - reference)
+            <= cfg.steady_position_error_tolerance
+        ) & (np.abs(state[3:]) <= cfg.steady_velocity_tolerance)
+        alpha = np.where(steady, steady_alpha, transient_alpha)
+        current = self.model.translation.tau_base
+        adapted = (1.0 - alpha) * current + alpha * force_achieved
+        adapted = np.clip(
+            adapted,
+            self.controller.config.force_min,
+            self.controller.config.force_max,
+        )
+        self.model.translation.tau_base = np.where(eligible, adapted, current)
+
     def _score_completed_predictions(
         self,
         filtered_position: np.ndarray,
@@ -217,7 +273,7 @@ class RotationAwareMPCTracker:
             record.state1 = self.model.predict_model1(
                 record.state1,
                 force_achieved,
-                record.force_previous,
+                record.tau_base,
                 delta_yaw,
             )
             record.state2 = self.model.predict_model2(
@@ -225,7 +281,6 @@ class RotationAwareMPCTracker:
                 force_achieved,
                 delta_yaw,
             )
-            record.force_previous = force_achieved.copy()
             record.steps += 1
             self.fusion.observe_position(
                 actual_position=filtered_position,
@@ -239,13 +294,13 @@ class RotationAwareMPCTracker:
                 retained.append(record)
         self._pending = retained
 
-    def _start_prediction(self, state: np.ndarray, force_previous: np.ndarray) -> None:
+    def _start_prediction(self, state: np.ndarray, tau_base: np.ndarray) -> None:
         self._pending.append(
             _PendingRotatingPrediction(
                 origin_index=self._frame_index,
                 state1=state.copy(),
                 state2=state.copy(),
-                force_previous=force_previous.copy(),
+                tau_base=tau_base.copy(),
             )
         )
 
@@ -274,6 +329,7 @@ class RotationAwareMPCTracker:
             rotation_visibility_from_body,
             camera_origin_in_body,
         )
+        tau_base_for_interval = self.model.translation.tau_base.copy()
 
         self._frame_index += 1
         if not self.estimator.initialized:
@@ -287,7 +343,7 @@ class RotationAwareMPCTracker:
             prediction1 = self.model.predict_model1(
                 old_state,
                 force,
-                self._force_before_last,
+                tau_base_for_interval,
                 delta_yaw,
             )
             prediction2 = self.model.predict_model2(
@@ -308,9 +364,9 @@ class RotationAwareMPCTracker:
             self._score_completed_predictions(state[:3], force, delta_yaw)
 
         self._yaw_previous = yaw
-        self._force_before_last = force.copy()
         self._yaw_moment_before_last = yaw_moment
-        self._start_prediction(state, force)
+        self._adapt_baseline_if_matched(state, force, reference_position)
+        self._start_prediction(state, self.model.translation.tau_base)
         position_visibility = body_to_visibility_position(
             state[:3],
             visibility_rotation,

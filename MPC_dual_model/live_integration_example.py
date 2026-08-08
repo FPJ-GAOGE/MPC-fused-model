@@ -9,32 +9,67 @@ from __future__ import annotations
 import numpy as np
 
 from camera_transform import camera_to_body_position
-from device_adapter import FineSUBThrusterAllocator, ForceCommandAdapter
+from dense_qp import QPSolverSettings
+from device_adapter import (
+    FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+    FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+    FineSUBThrusterAllocator,
+    ForceCommandAdapter,
+    finesub_translation_force_bounds,
+    finesub_translation_thruster_force_matrix,
+)
 from fossen_fixed_dl_model import FixedLinearDampingRelativeModel
 from mpc_controller import MPCConfig, RelativeMPCController
-from mpc_tracker import MPCTracker, build_default_staircase_fusion
+from mpc_tracker import (
+    BaselineAdaptationConfig,
+    MPCTracker,
+    build_default_staircase_fusion,
+)
 from relative_kalman import KalmanConfig, RelativePositionKalmanFilter
 
 
 def build_tracker() -> MPCTracker:
+    force_min, force_max = finesub_translation_force_bounds()
     model = FixedLinearDampingRelativeModel(
-        # TODO: replace every placeholder with pool-identification results.
-        M_t=np.diag([20.0, 25.0, 30.0]),
-        D_L=np.diag([8.0, 10.0, 12.0]),
+        # Identified in UnderwaterVision with direct +/-6 N and +/-12 N steps.
+        # Axis order is body forward/right/down = Unity X/Z/-Y.
+        M_t=np.diag([26.07276, 26.79684, 26.07276]),
+        D_L=np.diag([93.88006, 143.69195, 280.86849]),
         dt=0.05,
-        # Capture the real achieved hold force when AUTO is enabled.
+        # Start without privileged environment knowledge. The observable
+        # matched-state update below learns the required equilibrium force.
         tau_base=np.zeros(3),
     )
     config = MPCConfig(
         horizon=10,
-        reference_position=(0.60, 0.0, 0.0),
-        force_min=(-20.0, -15.0, -15.0),
-        force_max=(20.0, 15.0, 15.0),
-        delta_force_min=(-3.0, -2.0, -2.0),
-        delta_force_max=(3.0, 2.0, 2.0),
+        reference_position=(0.80, 0.0, 0.0),
+        # Tuned for horizontal tracking while retaining the exact V4 Pro1
+        # canonical per-thruster force envelope.
+        position_weights=(10000.0, 14000.0, 25000.0),
+        velocity_weights=(2.0, 20.0, 12.0),
+        force_weights=(0.003, 0.002, 0.04),
+        delta_force_weights=(0.01, 0.01, 0.5),
+        force_min=force_min,
+        force_max=force_max,
+        delta_force_min=(-4.0, -4.0, -5.6),
+        delta_force_max=(4.0, 4.0, 5.6),
+        thruster_command_matrix=finesub_translation_thruster_force_matrix(),
+        thruster_command_min=-np.asarray(FINESUB_V4_PRO1_FORCE_NEGATIVE_N),
+        thruster_command_max=np.asarray(FINESUB_V4_PRO1_FORCE_POSITIVE_N),
         horizontal_half_fov_deg=42.0,
         vertical_half_fov_deg=30.0,
         fov_margin_deg=5.0,
+        slack_quadratic_weight=5.0e4,
+        slack_linear_weight=100.0,
+        solver_settings=QPSolverSettings(
+            rho=10.0,
+            sigma=1e-8,
+            max_iterations=1500,
+            absolute_tolerance=2e-5,
+            relative_tolerance=3e-4,
+            # Leave 15 ms of the 50 ms control cycle for ROS and safety logic.
+            time_limit_seconds=0.035,
+        ),
     )
     estimator = RelativePositionKalmanFilter(
         model,
@@ -42,8 +77,7 @@ def build_tracker() -> MPCTracker:
     )
     controller = RelativeMPCController(model, config)
     adapter = ForceCommandAdapter(
-        # TODO: body force that produces the positive device limit.
-        positive_force_at_limit=(20.0, 15.0, 15.0),
+        positive_force_at_limit=force_max,
         # TODO: flip individual signs after a dry test if required.
         signs=(1.0, 1.0, 1.0),
         command_limits=(99.0, 99.0, 45.0),
@@ -62,6 +96,16 @@ def build_tracker() -> MPCTracker:
         adapter,
         fusion=fusion,
         thruster_allocator=allocator,
+        baseline_adaptation=BaselineAdaptationConfig(
+            enabled=True,
+            update_mode="gated_ema",
+            adaptation_rate=0.01,
+            transient_adaptation_rate=0.03,
+            steady_position_error_tolerance=0.03,
+            steady_velocity_tolerance=0.02,
+            position_error_tolerance=0.20,
+            velocity_tolerance=0.08,
+        ),
     )
 
 

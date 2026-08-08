@@ -266,13 +266,14 @@ class RotationAwareRelativeModel:
         self,
         state_current_body,
         force_current,
-        force_previous,
+        tau_base,
         delta_yaw_rad: float,
     ) -> Array:
+        """Predict the baseline-relative branch used by translation model 1."""
         return self.predict_translation(
             state_current_body,
             vector3(force_current, "force_current")
-            - vector3(force_previous, "force_previous"),
+            - vector3(tau_base, "tau_base"),
             delta_yaw_rad,
         )
 

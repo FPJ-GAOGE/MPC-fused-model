@@ -78,10 +78,13 @@ MPC 的水平、垂直视场约束也作用于同一个 `p_vis`，平移动力�
 
 ## 4. 平移双模型和 QP
 
-设模型一权重为逐轴对角矩阵 `A1`，`A2=I-A1`，决策变量为 `u[j]=Delta tau[j]`。融合速度为：
+设模型一权重为逐轴对角矩阵 `A1`，决策变量为
+`u[j]=Delta tau[j]`。模型一只使用基线相对力，模型二使用绝对力：
 
 ```text
-v[j+1] = R[j]Fv[j] + R[j]Gu[j] + A2 R[j]G tau[j-1]
+model1: f_eff[j] = tau[j] - tau_base
+model2: f_eff[j] = tau[j]
+v[j+1] = R[j]Fv[j] + R[j]Gtau[j] - A1 R[j]Gtau_base
 ```
 
 令 `e=p-p_d`，增广状态为：
@@ -99,22 +102,30 @@ e[j+1] = R[j]e[j] + Ts v[j+1] + (R[j]-I)p_d
 
 这形成仿射线性时变模型 `x[j+1]=A[j]x[j]+B[j]u[j]+d[j]`，因此在冻结 yaw 轨迹后仍是凸 QP。
 
-代价包括多步位置误差、速度、控制作用和力增量。默认 `force_cost_mode="effective"`，惩罚融合模型的有效输入代理：
+代价包括多步位置误差、速度、控制作用和力增量。默认
+`force_cost_mode="effective"`，惩罚与平移版相同的融合有效输入：
 
 ```text
-g[j] = Delta tau[j] + A2 tau[j-1]
+g[j] = tau[j] - A1 tau_base
 ```
 
-这减轻了此前的“模型一与绝对力代价冲突”。严格地说，动力学旧力项为
-`A2 R G tau_previous`，而该代理经过动力学矩阵后会成为
-`R G A2 tau_previous`；只有 `A2` 与 `R G` 可交换时才完全相同。若只为逐字复现 PDF
-中的 `tau' R tau`，可设置 `force_cost_mode="absolute"`。
+`tau_previous` 只保留在增广状态中用于力增量和绝对力递推，不再作为模型一基线。
+动力学使用精确融合项 `-A1 R G tau_base`；当 yaw 非零且三轴权重不同时，
+`R G A1` 与 `A1 R G` 不一定相等，因此力域的 `g[j]` 仍是代价代理，不是动力学项的
+严格因式分解。
+若只为逐字复现 PDF 中的 `tau' R tau`，可设置
+`force_cost_mode="absolute"`。
 
 约束包括：
 
 - 三轴绝对力限制；
 - 三轴力增量限制；
+- V4 Pro1 八台推进器逐台、正反向非对称的平移联合可达域；
 - 带松弛量的水平、垂直视场和前向距离限制。
+
+当前联合可达域只包含平移力。yaw 力矩由 QP 外的状态机/PID 产生，尚未与平移力一起
+进入同一个六自由度推进器约束，因此平移和大幅 yaw 同时发生时仍需后级分配器处理
+共同饱和。
 
 ## 5. 二维历史阶梯评价
 
@@ -126,16 +137,18 @@ H_cap = [3,3,2,2,1,1]
 omega_h = [0.5,0.3,0.2]
 ```
 
-历史回放每一步都使用实际执行力和实际 IMU yaw 增量，把两个模型预测转到同一目标时刻的机体系后再评分。`h=0` 只作为共同滤波起点，不参与评分；启用格子的权重会重新归一化。
+历史回放每一步都使用实际执行力、预测起点保存的 `tau_base` 和实际 IMU yaw 增量，
+把两个模型预测转到同一目标时刻的机体系后再评分。`h=0` 只作为共同滤波起点，
+不参与评分；启用格子的权重会重新归一化。
 
 ## 6. 运行
 
-在 `D:\FINSMCAT\Machine\MPC` 下：
+在当前 MPC 工作区下：
 
-```powershell
-python -m pip install -r .\MPC_dual_model_yaw\requirements.txt
-python -m unittest discover -s .\MPC_dual_model_yaw\tests -v
-python -m MPC_dual_model_yaw.example_yaw_simulation
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --project MPC_dual_model --group dev \
+  python -m pytest -q MPC_dual_model_yaw/tests
+uv run --project MPC_dual_model python -m MPC_dual_model_yaw.example_yaw_simulation
 ```
 
 实时入口：
@@ -179,10 +192,12 @@ motor = output.thruster_allocation.throttles
 
 ## 7. 仍未解决的边界
 
-- 示例参数均是占位值，不能直接上实机。
+- 平移参数已同步当前 Unity 调优值；yaw 惯量、阻尼、PID 和力矩限额仍是占位值，
+  不能直接上实机。
 - 仅补偿 yaw，不包含 roll/pitch 对视觉相对坐标的旋转影响。
 - 尚未实现相机延迟的 IMU 历史回放。
-- 当前 `FineSUBThrusterAllocator` 仍是固件归一化混控复现；物理推力曲线、正反推力不对称和电池电压影响仍需标定。
+- QP 已使用 V4 Pro1 平移正反推力限额，但 `FineSUBThrusterAllocator` 仍是固件归一化
+  混控复现；yaw 与平移的共同饱和、死区、电池电压和推进器互扰仍需标定。
 - 默认要求 OSQP；未安装时会在控制器构造阶段明确报错，不会在 20 Hz 循环中静默切换到较慢求解器。
 
 完整实机参数见 `CALIBRATION_CHECKLIST.md`；与 PDF 和参考推导的逐项差异见
