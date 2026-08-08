@@ -43,6 +43,141 @@ FINESUB_V4_PRO1_FORCE_NEGATIVE_N = (
     7.9750,
 )
 
+# Calibrated UnderwaterVision geometry in the UUV Rigidbody body frame.
+# Unity uses x/y/z = forward/up/right. Positive thruster force follows the
+# normalized local force direction. The order is FINESUB_CANONICAL_THRUSTERS.
+FINESUB_UNITY_THRUSTER_POSITIONS_BODY_M = np.array(
+    [
+        [0.08312216, -0.030930428, 0.13304673],
+        [-0.13687684, -0.030930420, 0.13304667],
+        [-0.13687672, -0.030930437, -0.14295308],
+        [0.08312222, -0.030930420, -0.14295302],
+        [0.19834375, -0.042830437, 0.12746146],
+        [-0.23286586, -0.042830452, 0.14669480],
+        [-0.23286586, -0.042830437, -0.15660119],
+        [0.19834371, -0.042830423, -0.13736765],
+    ],
+    dtype=float,
+)
+_SQRT_HALF = np.sqrt(0.5)
+FINESUB_UNITY_THRUSTER_DIRECTIONS_BODY = np.array(
+    [
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [_SQRT_HALF, 0.0, -_SQRT_HALF],
+        [_SQRT_HALF, 0.0, _SQRT_HALF],
+        [-_SQRT_HALF, 0.0, _SQRT_HALF],
+        [-_SQRT_HALF, 0.0, -_SQRT_HALF],
+    ],
+    dtype=float,
+)
+FINESUB_UNITY_CENTER_OF_MASS_BODY_M = np.array(
+    [0.0, -0.08, 0.0], dtype=float
+)
+
+
+def finesub_six_dof_wrench_matrix_unity() -> np.ndarray:
+    """Map eight signed thruster forces to a Unity-body 6-D wrench.
+
+    The output row order is ``[Fx, Fy, Fz, Mx, My, Mz]``. Force and moment
+    are applied about the calibrated Rigidbody center of mass.
+    """
+    directions = FINESUB_UNITY_THRUSTER_DIRECTIONS_BODY
+    lever_arms = (
+        FINESUB_UNITY_THRUSTER_POSITIONS_BODY_M
+        - FINESUB_UNITY_CENTER_OF_MASS_BODY_M
+    )
+    moments = np.cross(lever_arms, directions)
+    matrix = np.vstack((directions.T, moments.T))
+    if np.linalg.matrix_rank(matrix) < 6:
+        raise ValueError("FineSUB thruster geometry cannot produce a 6-D wrench")
+    return matrix
+
+
+def finesub_six_dof_wrench_matrix_frd() -> np.ndarray:
+    """Map eight thruster forces to model-frame FRD force and moment.
+
+    Rows are ``[F_forward, F_right, F_down, M_roll, M_pitch, M_yaw]``.
+    Positive yaw turns the nose right about the down axis.
+    """
+    unity = finesub_six_dof_wrench_matrix_unity()
+    return np.vstack(
+        (
+            unity[0],
+            unity[2],
+            -unity[1],
+            unity[3],
+            unity[5],
+            -unity[4],
+        )
+    )
+
+
+def finesub_translation_force_outer_bounds(
+    force_positive_n: object = FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+    force_negative_n: object = FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return broad FRD force bounds implied by individual motor limits.
+
+    These bounds deliberately ignore moment equalities. The rotation-aware QP
+    imposes the full six-axis wrench equation, so they only provide finite
+    numerical bounds and do not shrink the exact reachable set.
+    """
+    positive = np.asarray(force_positive_n, dtype=float).reshape(-1)
+    negative = np.asarray(force_negative_n, dtype=float).reshape(-1)
+    if positive.shape != (8,) or negative.shape != (8,):
+        raise ValueError("force_positive_n and force_negative_n must contain 8 values")
+    if (
+        not np.all(np.isfinite(positive))
+        or not np.all(np.isfinite(negative))
+        or np.any(positive <= 0.0)
+        or np.any(negative <= 0.0)
+    ):
+        raise ValueError("per-thruster force limits must be positive and finite")
+
+    force_matrix = finesub_six_dof_wrench_matrix_frd()[:3]
+    lower = np.sum(
+        np.where(force_matrix >= 0.0, -force_matrix * negative, force_matrix * positive),
+        axis=1,
+    )
+    upper = np.sum(
+        np.where(force_matrix >= 0.0, force_matrix * positive, -force_matrix * negative),
+        axis=1,
+    )
+    return lower, upper
+
+
+def finesub_planar_wrench_thruster_force_matrix() -> np.ndarray:
+    """Map model ``[forward, right, down, yaw]`` to eight forces.
+
+    This is the minimum-norm inverse of the complete Unity 6-D geometry. The
+    requested roll and pitch moments are zero, so translation and yaw share
+    the same eight physical thrusters without introducing hidden attitude
+    moments. Positive yaw is about the model down axis (negative Unity Y).
+    """
+    desired_wrench = np.zeros((6, 4), dtype=float)
+    desired_wrench[0, 0] = 1.0   # forward -> Unity +X force
+    desired_wrench[2, 1] = 1.0   # right   -> Unity +Z force
+    desired_wrench[1, 2] = -1.0  # down    -> Unity -Y force
+    desired_wrench[4, 3] = -1.0  # yaw     -> Unity -Y moment
+    return np.linalg.pinv(
+        finesub_six_dof_wrench_matrix_unity(), rcond=1.0e-10
+    ) @ desired_wrench
+
+
+def finesub_planar_wrench_translation_force_bounds(
+    force_positive_n: object = FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+    force_negative_n: object = FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return no-yaw independent FRD bounds for the 6-D allocation."""
+    return _translation_force_bounds_for_matrix(
+        finesub_planar_wrench_thruster_force_matrix()[:, :3],
+        force_positive_n,
+        force_negative_n,
+    )
+
 
 def finesub_translation_thruster_force_matrix() -> np.ndarray:
     """Map body translation force to canonical per-thruster force in N.
@@ -76,7 +211,21 @@ def finesub_translation_force_bounds(
     The QP also applies every per-thruster row, so these axis bounds are only
     the exact feasible intervals when the other two requested axes are zero.
     """
-    matrix = finesub_translation_thruster_force_matrix()
+    return _translation_force_bounds_for_matrix(
+        finesub_translation_thruster_force_matrix(),
+        force_positive_n,
+        force_negative_n,
+    )
+
+
+def _translation_force_bounds_for_matrix(
+    matrix: np.ndarray,
+    force_positive_n: object,
+    force_negative_n: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape != (8, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("translation allocation matrix must have shape (8, 3)")
     positive = np.asarray(force_positive_n, dtype=float).reshape(-1)
     negative = np.asarray(force_negative_n, dtype=float).reshape(-1)
     if positive.shape != (8,) or negative.shape != (8,):

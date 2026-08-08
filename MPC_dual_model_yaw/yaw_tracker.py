@@ -186,8 +186,11 @@ class RotationAwareMPCTracker:
         achieved_moment = finite_scalar(
             yaw_moment_achieved_previous, "yaw_moment_achieved_previous"
         )
-        force = self.controller.safe_force(achieved_force)
         moment = self.yaw_controller.safe_moment(achieved_moment)
+        force = self.controller.safe_force(
+            achieved_force,
+            yaw_moment=moment,
+        )
 
         # A measurement gap has unknown duration in this interface.  Discard
         # all target-dependent state so the next valid camera frame starts a

@@ -19,8 +19,8 @@ from MPC_dual_model.device_adapter import (
     FINESUB_V4_PRO1_FORCE_POSITIVE_N,
     FineSUBThrusterAllocator,
     ForceCommandAdapter,
-    finesub_translation_force_bounds,
-    finesub_translation_thruster_force_matrix,
+    finesub_six_dof_wrench_matrix_frd,
+    finesub_translation_force_outer_bounds,
 )
 from MPC_dual_model.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel,
@@ -40,7 +40,8 @@ from .yaw_tracker import (
 
 
 def build_tracker() -> RotationAwareMPCTracker:
-    force_min, force_max = finesub_translation_force_bounds()
+    force_min, force_max = finesub_translation_force_outer_bounds()
+    wrench_matrix = finesub_six_dof_wrench_matrix_frd()
     translation = FixedLinearDampingRelativeModel(
         # Identified in UnderwaterVision with direct +/-6 N and +/-12 N steps.
         # Axis order is body forward/right/down = Unity X/Z/-Y.
@@ -50,9 +51,9 @@ def build_tracker() -> RotationAwareMPCTracker:
         tau_base=np.zeros(3),
     )
     yaw = LinearYawDynamics(
-        # TODO: m_omega=I_z-N_rdot and identified yaw damping.
-        effective_inertia=2.5,
-        linear_damping=1.2,
+        # Closed-loop UnderwaterVision estimate from direct-world yaw trials.
+        effective_inertia=0.8,
+        linear_damping=0.8,
         quadratic_damping=0.0,
         dt=translation.dt,
     )
@@ -60,18 +61,21 @@ def build_tracker() -> RotationAwareMPCTracker:
     yaw_controller = YawStateController(
         yaw,
         YawControlConfig(
-            # TODO: determine FOV trigger hysteresis and all PID gains in pool tests.
-            alpha_on=np.deg2rad(25.0),
-            alpha_off=np.deg2rad(10.0),
-            alpha_emergency=np.deg2rad(35.0),
+            alpha_on=np.deg2rad(4.0),
+            alpha_off=np.deg2rad(1.5),
+            alpha_emergency=np.deg2rad(8.0),
             trigger_frames=3,
             settle_frames=5,
-            omega_command_max=np.deg2rad(35.0),
+            outer_kp=2.5,
+            outer_kd=0.4,
+            inner_kp=1.5,
+            inner_ki=0.1,
+            omega_command_max=np.deg2rad(45.0),
             omega_command_acceleration_max=np.deg2rad(60.0),
-            yaw_moment_min=-4.0,
-            yaw_moment_max=4.0,
-            delta_yaw_moment_min=-0.8,
-            delta_yaw_moment_max=0.8,
+            yaw_moment_min=-2.0,
+            yaw_moment_max=2.0,
+            delta_yaw_moment_min=-0.3,
+            delta_yaw_moment_max=0.3,
         ),
     )
     controller = RotationAwareMPCController(
@@ -88,9 +92,9 @@ def build_tracker() -> RotationAwareMPCTracker:
             force_max=force_max,
             delta_force_min=(-4.0, -4.0, -5.6),
             delta_force_max=(4.0, 4.0, 5.6),
-            thruster_command_matrix=finesub_translation_thruster_force_matrix(),
-            thruster_command_min=-np.asarray(FINESUB_V4_PRO1_FORCE_NEGATIVE_N),
-            thruster_command_max=np.asarray(FINESUB_V4_PRO1_FORCE_POSITIVE_N),
+            thruster_wrench_matrix=wrench_matrix,
+            thruster_force_min=-np.asarray(FINESUB_V4_PRO1_FORCE_NEGATIVE_N),
+            thruster_force_max=np.asarray(FINESUB_V4_PRO1_FORCE_POSITIVE_N),
             horizontal_half_fov_deg=42.0,
             vertical_half_fov_deg=30.0,
             fov_margin_deg=5.0,
@@ -117,8 +121,8 @@ def build_tracker() -> RotationAwareMPCTracker:
         command_limits=(99.0, 99.0, 45.0),
     )
     yaw_adapter = YawMomentChannelAdapter(
-        # TODO: measured yaw moment at FineSUB normalized yaw=+0.20.
-        positive_yaw_moment_at_limit=4.0,
+        # Unity tuning limit; replace with measured real-vehicle calibration.
+        positive_yaw_moment_at_limit=2.0,
         channel_limit=0.20,
         sign=1.0,
     )

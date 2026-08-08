@@ -3,6 +3,10 @@ import unittest
 import numpy as np
 
 from MPC_dual_model.dense_qp import QPSolverSettings
+from MPC_dual_model.device_adapter import (
+    finesub_planar_wrench_thruster_force_matrix,
+    finesub_six_dof_wrench_matrix_unity,
+)
 from MPC_dual_model.fossen_fixed_dl_model import FixedLinearDampingRelativeModel
 from MPC_dual_model_yaw.yaw_controller import (
     YawControlConfig,
@@ -130,6 +134,18 @@ class YawMPCTest(unittest.TestCase):
             model.dt * expected_velocity,
             atol=1.0e-12,
         )
+
+    def test_planar_allocator_reproduces_wrench_without_roll_or_pitch(self) -> None:
+        allocation = finesub_planar_wrench_thruster_force_matrix()
+        geometry = finesub_six_dof_wrench_matrix_unity()
+        expected = np.zeros((6, 4))
+        expected[0, 0] = 1.0
+        expected[2, 1] = 1.0
+        expected[1, 2] = -1.0
+        expected[4, 3] = -1.0
+
+        self.assertEqual(allocation.shape, (8, 4))
+        np.testing.assert_allclose(geometry @ allocation, expected, atol=1.0e-12)
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,12 +58,12 @@ class YawMPCConfig:
     delta_force_min: object = (-4.0, -3.0, -3.0)
     delta_force_max: object = (4.0, 3.0, 3.0)
 
-    # Optional physical per-thruster envelope for the translation force.
-    # Yaw moment remains a separate channel and is not included in this map.
-    thruster_command_matrix: object | None = None
-    thruster_command_limit: float = 1.0
-    thruster_command_min: object | None = None
-    thruster_command_max: object | None = None
+    # Optional exact actuator model. Each horizon step gets one force variable
+    # per thruster and enforces W*u=[F_frd, 0_roll, 0_pitch, N_yaw].
+    thruster_wrench_matrix: object | None = None
+    thruster_force_min: object | None = None
+    thruster_force_max: object | None = None
+    thruster_force_regularization: float = 1.0e-5
 
     forward_distance_min: float = 0.25
     forward_distance_max: float = 1.50
@@ -107,44 +107,49 @@ class YawMPCConfig:
         self.force_max = vector3(self.force_max, "force_max")
         self.delta_force_min = vector3(self.delta_force_min, "delta_force_min")
         self.delta_force_max = vector3(self.delta_force_max, "delta_force_max")
-        if self.thruster_command_matrix is not None:
-            matrix = np.asarray(self.thruster_command_matrix, dtype=float)
+        if self.thruster_wrench_matrix is not None:
+            matrix = np.asarray(self.thruster_wrench_matrix, dtype=float)
             if (
                 matrix.ndim != 2
-                or matrix.shape[1] != 3
-                or matrix.shape[0] < 1
+                or matrix.shape[0] != 6
+                or matrix.shape[1] < 6
                 or not np.all(np.isfinite(matrix))
             ):
-                raise ValueError("thruster_command_matrix must have shape (n, 3)")
-            self.thruster_command_matrix = matrix
-        if self.thruster_command_limit <= 0.0 or not np.isfinite(
-            self.thruster_command_limit
-        ):
-            raise ValueError("thruster_command_limit must be positive and finite")
-        if self.thruster_command_matrix is None:
+                raise ValueError("thruster_wrench_matrix must have shape (6, n), n>=6")
+            if np.linalg.matrix_rank(matrix) < 6:
+                raise ValueError("thruster_wrench_matrix must span six-axis wrench space")
+            self.thruster_wrench_matrix = matrix
+        if self.thruster_wrench_matrix is None:
             if (
-                self.thruster_command_min is not None
-                or self.thruster_command_max is not None
+                self.thruster_force_min is not None
+                or self.thruster_force_max is not None
             ):
-                raise ValueError("thruster bounds require thruster_command_matrix")
+                raise ValueError(
+                    "thruster force bounds require thruster_wrench_matrix"
+                )
         else:
-            row_count = self.thruster_command_matrix.shape[0]
-            self.thruster_command_min = self._normalize_thruster_bound(
-                self.thruster_command_min,
-                -self.thruster_command_limit,
-                row_count,
-                "thruster_command_min",
+            thruster_count = self.thruster_wrench_matrix.shape[1]
+            self.thruster_force_min = self._normalize_thruster_bound(
+                self.thruster_force_min,
+                -1.0,
+                thruster_count,
+                "thruster_force_min",
             )
-            self.thruster_command_max = self._normalize_thruster_bound(
-                self.thruster_command_max,
-                self.thruster_command_limit,
-                row_count,
-                "thruster_command_max",
+            self.thruster_force_max = self._normalize_thruster_bound(
+                self.thruster_force_max,
+                1.0,
+                thruster_count,
+                "thruster_force_max",
             )
-            if np.any(self.thruster_command_min >= 0.0) or np.any(
-                self.thruster_command_max <= 0.0
+            if np.any(self.thruster_force_min >= 0.0) or np.any(
+                self.thruster_force_max <= 0.0
             ):
                 raise ValueError("each thruster interval must contain zero")
+        if (
+            not np.isfinite(self.thruster_force_regularization)
+            or self.thruster_force_regularization < 0.0
+        ):
+            raise ValueError("thruster_force_regularization must be finite and nonnegative")
         if self.force_cost_mode not in {"effective", "absolute"}:
             raise ValueError("force_cost_mode must be 'effective' or 'absolute'")
         if np.any(self.force_min >= self.force_max):
@@ -189,6 +194,7 @@ class YawMPCResult:
     yaw_moment: float
     force_sequence: Array
     delta_force_sequence: Array
+    thruster_force_sequence: Array
     predicted_states: Array
     predicted_augmented_states: Array
     frozen_yaw_angles: Array
@@ -207,6 +213,11 @@ class YawMPCResult:
     def input_sequence(self) -> Array:
         """Compatibility alias: the QP now returns absolute force sequence."""
         return self.force_sequence
+
+    @property
+    def thruster_force(self) -> Array:
+        """First exact per-thruster allocation selected by the QP."""
+        return self.thruster_force_sequence[0]
 
 
 class RotationAwareMPCController:
@@ -234,15 +245,29 @@ class RotationAwareMPCController:
         self.solver = create_qp_solver(self.config.solver_settings)
         self._warm_start: Array | None = None
         self._last_feasible_force: Array | None = None
+        self._last_feasible_thruster_force: Array | None = None
 
     def reset(self) -> None:
         self._warm_start = None
         self._last_feasible_force = None
+        self._last_feasible_thruster_force = None
+
+    @property
+    def thruster_count(self) -> int:
+        matrix = self.config.thruster_wrench_matrix
+        return 0 if matrix is None else int(matrix.shape[1])
+
+    def _decision_layout(self) -> tuple[int, int, int, int]:
+        n_input = self.INPUT_DIM * self.config.horizon
+        n_thruster = self.thruster_count * self.config.horizon
+        n_slack = self.SLACKS_PER_STEP * self.config.horizon
+        return n_input, n_thruster, n_slack, n_input + n_thruster + n_slack
 
     def safe_force(
         self,
         force_previous,
         force_target=None,
+        yaw_moment: float = 0.0,
     ) -> Array:
         previous = vector3(force_previous, "force_previous")
         target = (
@@ -250,7 +275,7 @@ class RotationAwareMPCController:
             if force_target is None
             else vector3(force_target, "force_target")
         )
-        return self._safe_fallback(previous, target)
+        return self._safe_fallback(previous, target, yaw_moment=yaw_moment)
 
     def _validate_yaw_prediction(self, prediction: YawPrediction) -> None:
         N = self.config.horizon
@@ -389,16 +414,21 @@ class RotationAwareMPCController:
                 self.effective_force_matrix.T @ R_bar @ effective_offset
             )
 
-        n_input = 3 * N
-        n_slack = self.SLACKS_PER_STEP * N
-        P = np.zeros((n_input + n_slack, n_input + n_slack))
-        q = np.zeros(n_input + n_slack)
+        n_input, n_thruster, n_slack, n_variable = self._decision_layout()
+        thruster_start = n_input
+        slack_start = n_input + n_thruster
+        P = np.zeros((n_variable, n_variable))
+        q = np.zeros(n_variable)
         P[:n_input, :n_input] = 2.0 * hessian
-        P[n_input:, n_input:] = (
+        if n_thruster:
+            P[thruster_start:slack_start, thruster_start:slack_start] = (
+                2.0 * cfg.thruster_force_regularization * np.eye(n_thruster)
+            )
+        P[slack_start:, slack_start:] = (
             2.0 * cfg.slack_quadratic_weight * np.eye(n_slack)
         )
         q[:n_input] = 2.0 * gradient
-        q[n_input:] = cfg.slack_linear_weight
+        q[slack_start:] = cfg.slack_linear_weight
         P += 1.0e-9 * np.eye(P.shape[0])
         return P, q
 
@@ -413,9 +443,9 @@ class RotationAwareMPCController:
         cfg = self.config
         N = cfg.horizon
         nz = self.AUGMENTED_DIM
-        n_input = 3 * N
-        n_slack = self.SLACKS_PER_STEP * N
-        n_variable = n_input + n_slack
+        n_input, n_thruster, n_slack, n_variable = self._decision_layout()
+        thruster_start = n_input
+        slack_start_global = n_input + n_thruster
         rows: list[Array] = []
         lower: list[float] = []
         upper: list[float] = []
@@ -445,29 +475,43 @@ class RotationAwareMPCController:
                     cfg.force_max[axis] - constant,
                 )
 
-        # Preserve the exact asymmetric V4 Pro1 translation envelope at every
-        # prediction step. Simultaneous yaw usage must be handled later by a
-        # six-DoF allocator because yaw is not a decision variable in this QP.
-        if cfg.thruster_command_matrix is not None:
+        # Exact actuator reachable set. Thruster forces remain free QP
+        # variables; the six wrench equalities retain all actuator null-space
+        # freedom instead of committing to one pseudoinverse allocation.
+        if cfg.thruster_wrench_matrix is not None:
+            thruster_count = self.thruster_count
             for step in range(N):
                 force_rows = slice(nz * step + 6, nz * step + 9)
                 force_gain = self.Su[force_rows]
                 force_free = free_prediction[force_rows]
-                for row_index, command_row in enumerate(
-                    cfg.thruster_command_matrix
-                ):
+
+                step_thruster_start = thruster_start + step * thruster_count
+                for thruster_index in range(thruster_count):
                     row = np.zeros(n_variable)
-                    row[:n_input] = command_row @ force_gain
-                    constant = float(command_row @ force_free)
+                    row[step_thruster_start + thruster_index] = 1.0
                     append_row(
                         row,
-                        cfg.thruster_command_min[row_index] - constant,
-                        cfg.thruster_command_max[row_index] - constant,
+                        cfg.thruster_force_min[thruster_index],
+                        cfg.thruster_force_max[thruster_index],
                     )
+
+                for wrench_axis in range(6):
+                    row = np.zeros(n_variable)
+                    row[
+                        step_thruster_start : step_thruster_start + thruster_count
+                    ] = cfg.thruster_wrench_matrix[wrench_axis]
+                    if wrench_axis < 3:
+                        row[:n_input] -= force_gain[wrench_axis]
+                        target = force_free[wrench_axis]
+                    elif wrench_axis < 5:
+                        target = 0.0
+                    else:
+                        target = yaw_prediction.moments[step]
+                    append_row(row, target, target)
 
         for index in range(n_slack):
             row = np.zeros(n_variable)
-            row[n_input + index] = 1.0
+            row[slack_start_global + index] = 1.0
             append_row(row, 0.0, cfg.slack_max)
 
         horizontal_gain = np.tan(
@@ -495,7 +539,7 @@ class RotationAwareMPCController:
             forward_free = p_free[cfg.forward_axis]
             horizontal_free = p_free[cfg.horizontal_axis]
             vertical_free = p_free[cfg.vertical_axis]
-            slack_start = n_input + self.SLACKS_PER_STEP * step
+            slack_start = slack_start_global + self.SLACKS_PER_STEP * step
 
             def soft_upper(coefficients, constant, slack_local, limit=0.0) -> None:
                 row = np.zeros(n_variable)
@@ -530,47 +574,125 @@ class RotationAwareMPCController:
 
     def _shift_warm_start(self, decision: Array) -> Array:
         N = self.config.horizon
-        n_input = 3 * N
+        n_input, n_thruster, _, _ = self._decision_layout()
+        thruster_start = n_input
+        slack_start = n_input + n_thruster
         delta = decision[:n_input].reshape(N, 3)
-        slack = decision[n_input:].reshape(N, self.SLACKS_PER_STEP)
-        return np.concatenate(
-            (
-                np.vstack((delta[1:], np.zeros((1, 3)))).ravel(),
-                np.vstack((slack[1:], slack[-1:])).ravel(),
+        parts = [np.vstack((delta[1:], np.zeros((1, 3)))).ravel()]
+        if n_thruster:
+            thruster = decision[thruster_start:slack_start].reshape(
+                N, self.thruster_count
             )
-        )
+            parts.append(np.vstack((thruster[1:], thruster[-1:])).ravel())
+        slack = decision[slack_start:].reshape(N, self.SLACKS_PER_STEP)
+        parts.append(np.vstack((slack[1:], slack[-1:])).ravel())
+        return np.concatenate(parts)
 
-    def _safe_fallback(self, previous: Array, target: Array) -> Array:
+    def _project_reachable_wrench(
+        self,
+        previous: Array,
+        target: Array,
+        yaw_moment: float,
+        *,
+        lock_force: bool = False,
+    ) -> tuple[Array, Array]:
         cfg = self.config
+        yaw = finite_scalar(yaw_moment, "yaw_moment")
         previous = np.clip(previous, cfg.force_min, cfg.force_max)
         low = np.maximum(cfg.force_min, previous + cfg.delta_force_min)
         high = np.minimum(cfg.force_max, previous + cfg.delta_force_max)
-        force = np.minimum(np.maximum(target, low), high)
-        if cfg.thruster_command_matrix is None:
-            return force
+        target = np.minimum(np.maximum(target, low), high)
+        if lock_force:
+            low = target.copy()
+            high = target.copy()
 
-        for _ in range(8):
-            force = np.minimum(np.maximum(force, low), high)
-            for row_index, command_row in enumerate(cfg.thruster_command_matrix):
-                value = float(command_row @ force)
-                lower_bound = cfg.thruster_command_min[row_index]
-                upper_bound = cfg.thruster_command_max[row_index]
-                norm_sq = max(
-                    float(command_row @ command_row), np.finfo(float).eps
-                )
-                if value > upper_bound:
-                    force -= (value - upper_bound) / norm_sq * command_row
-                elif value < lower_bound:
-                    force += (lower_bound - value) / norm_sq * command_row
-        return np.minimum(np.maximum(force, low), high)
+        matrix = cfg.thruster_wrench_matrix
+        if matrix is None:
+            return target, np.zeros(0)
 
-    def thruster_utilization(self, force, row_indices=None) -> float:
-        """Return largest direction-aware translation-thruster utilization."""
-        if self.config.thruster_command_matrix is None:
+        thruster_count = self.thruster_count
+        n_variable = 3 + thruster_count
+        P = np.zeros((n_variable, n_variable))
+        q = np.zeros(n_variable)
+        P[:3, :3] = 2.0 * np.eye(3)
+        q[:3] = -2.0 * target
+        P[3:, 3:] = 2.0 * max(
+            cfg.thruster_force_regularization, 1.0e-9
+        ) * np.eye(thruster_count)
+
+        rows = []
+        lower = []
+        upper = []
+        force_bounds = np.zeros((3, n_variable))
+        force_bounds[:, :3] = np.eye(3)
+        rows.append(force_bounds)
+        lower.extend(low)
+        upper.extend(high)
+        thruster_bounds = np.zeros((thruster_count, n_variable))
+        thruster_bounds[:, 3:] = np.eye(thruster_count)
+        rows.append(thruster_bounds)
+        lower.extend(cfg.thruster_force_min)
+        upper.extend(cfg.thruster_force_max)
+
+        wrench_equalities = np.zeros((6, n_variable))
+        wrench_equalities[:, 3:] = matrix
+        wrench_equalities[:3, :3] = -np.eye(3)
+        desired = np.array([0.0, 0.0, 0.0, 0.0, 0.0, yaw])
+        rows.append(wrench_equalities)
+        lower.extend(desired)
+        upper.extend(desired)
+        solution = self.solver.solve(
+            P,
+            q,
+            np.vstack(rows),
+            np.asarray(lower),
+            np.asarray(upper),
+        )
+        if solution.solved:
+            return solution.x[:3].copy(), solution.x[3:].copy()
+
+        # Deterministic emergency path. The exact minimum-norm inverse is only
+        # used after a solver failure and is scaled toward zero translation.
+        inverse = np.linalg.pinv(matrix, rcond=1.0e-10)
+        for scale in np.linspace(1.0, 0.0, 101):
+            force = np.minimum(np.maximum(scale * target, low), high)
+            desired[:3] = force
+            thruster = inverse @ desired
+            if np.all(thruster >= cfg.thruster_force_min - 1.0e-9) and np.all(
+                thruster <= cfg.thruster_force_max + 1.0e-9
+            ):
+                return force, thruster
+        return np.zeros(3), np.zeros(thruster_count)
+
+    def _safe_fallback(
+        self,
+        previous: Array,
+        target: Array,
+        yaw_moment: float = 0.0,
+    ) -> Array:
+        force, thruster = self._project_reachable_wrench(
+            previous,
+            target,
+            finite_scalar(yaw_moment, "yaw_moment"),
+        )
+        self._last_feasible_thruster_force = thruster.copy()
+        return force
+
+    def thruster_utilization_from_allocation(
+        self,
+        thruster_force,
+        row_indices=None,
+    ) -> float:
+        """Return direction-aware utilization of an explicit allocation."""
+        if self.config.thruster_wrench_matrix is None:
             return 0.0
-        values = self.config.thruster_command_matrix @ vector3(force, "force")
-        lower = self.config.thruster_command_min
-        upper = self.config.thruster_command_max
+        values = np.asarray(thruster_force, dtype=float).reshape(-1)
+        if values.shape != (self.thruster_count,) or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"thruster_force must contain {self.thruster_count} finite values"
+            )
+        lower = self.config.thruster_force_min
+        upper = self.config.thruster_force_max
         if row_indices is not None:
             indices = np.asarray(row_indices, dtype=int).reshape(-1)
             values = values[indices]
@@ -578,6 +700,24 @@ class RotationAwareMPCController:
             upper = upper[indices]
         scales = np.where(values >= 0.0, upper, -lower)
         return float(np.max(np.abs(values) / scales))
+
+    def thruster_utilization(
+        self,
+        force,
+        yaw_moment: float = 0.0,
+        row_indices=None,
+    ) -> float:
+        """Return largest direction-aware joint wrench utilization."""
+        if self.config.thruster_wrench_matrix is None:
+            return 0.0
+        requested_force = vector3(force, "force")
+        _, thruster = self._project_reachable_wrench(
+            requested_force,
+            requested_force,
+            finite_scalar(yaw_moment, "yaw_moment"),
+            lock_force=True,
+        )
+        return self.thruster_utilization_from_allocation(thruster, row_indices)
 
     def solve(
         self,
@@ -640,12 +780,17 @@ class RotationAwareMPCController:
         )
 
         N = self.config.horizon
-        n_input = 3 * N
+        n_input, n_thruster, _, _ = self._decision_layout()
+        thruster_start = n_input
+        slack_start = n_input + n_thruster
         if solution.solved:
             decision = solution.x
             delta_sequence = decision[:n_input].reshape(N, 3)
+            thruster_sequence = decision[thruster_start:slack_start].reshape(
+                N, self.thruster_count
+            )
             slacks = np.clip(
-                decision[n_input:].reshape(N, self.SLACKS_PER_STEP),
+                decision[slack_start:].reshape(N, self.SLACKS_PER_STEP),
                 0.0,
                 self.config.slack_max,
             )
@@ -653,15 +798,10 @@ class RotationAwareMPCController:
                 free_prediction + self.Su @ delta_sequence.ravel()
             ).reshape(N, self.AUGMENTED_DIM)
             force_sequence = predicted_augmented[:, 6:9].copy()
-            force = self._safe_fallback(previous, force_sequence[0])
-            delta_sequence[0] = force - previous
-            predicted_augmented = (
-                free_prediction + self.Su @ delta_sequence.ravel()
-            ).reshape(N, self.AUGMENTED_DIM)
-            force_sequence = predicted_augmented[:, 6:9].copy()
-            force_sequence[0] = force
+            force = force_sequence[0].copy()
             self._warm_start = self._shift_warm_start(decision)
             self._last_feasible_force = force.copy()
+            self._last_feasible_thruster_force = thruster_sequence[0].copy()
             used_fallback = False
             status = solution.status
         else:
@@ -671,13 +811,20 @@ class RotationAwareMPCController:
             else:
                 fallback_target = self._last_feasible_force
                 fallback_source = "last_feasible"
-            force = self._safe_fallback(previous, fallback_target)
+            force = self._safe_fallback(
+                previous,
+                fallback_target,
+                yaw_moment=yaw_prediction.moments[0],
+            )
             delta_sequence = np.zeros((N, 3))
             delta_sequence[0] = force - previous
             predicted_augmented = (
                 free_prediction + self.Su @ delta_sequence.ravel()
             ).reshape(N, self.AUGMENTED_DIM)
             force_sequence = predicted_augmented[:, 6:9].copy()
+            thruster_sequence = np.zeros((N, self.thruster_count))
+            if self.thruster_count:
+                thruster_sequence[0] = self._last_feasible_thruster_force
             slacks = np.zeros((N, self.SLACKS_PER_STEP))
             self._warm_start = None
             used_fallback = True
@@ -691,6 +838,7 @@ class RotationAwareMPCController:
             yaw_moment=float(yaw_prediction.moments[0]),
             force_sequence=force_sequence,
             delta_force_sequence=delta_sequence,
+            thruster_force_sequence=thruster_sequence,
             predicted_states=predicted_states,
             predicted_augmented_states=predicted_augmented,
             frozen_yaw_angles=np.asarray(yaw_prediction.angles, dtype=float).copy(),
