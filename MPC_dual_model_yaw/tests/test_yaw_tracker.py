@@ -130,11 +130,11 @@ class YawTrackerTest(unittest.TestCase):
         yaw_config = tracker.yaw_controller.config
         self.assertAlmostEqual(tracker.model.yaw.effective_inertia, 0.8)
         self.assertAlmostEqual(tracker.model.yaw.linear_damping, 0.8)
-        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_on), 4.0)
-        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_off), 1.5)
-        self.assertAlmostEqual(yaw_config.outer_kp, 2.5)
-        self.assertAlmostEqual(yaw_config.inner_kp, 1.5)
-        self.assertAlmostEqual(yaw_config.yaw_moment_max, 2.0)
+        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_on), 1.8)
+        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_off), 0.7)
+        self.assertAlmostEqual(yaw_config.outer_kp, 4.0)
+        self.assertAlmostEqual(yaw_config.inner_kp, 2.0)
+        self.assertAlmostEqual(yaw_config.yaw_moment_max, 1.5)
         self.assertTrue(tracker.baseline_adaptation.enabled)
         self.assertEqual(tracker.baseline_adaptation.update_mode, "gated_ema")
 

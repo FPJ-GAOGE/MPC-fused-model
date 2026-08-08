@@ -70,9 +70,9 @@
 
 ## E. yaw 状态机与双环 PID（实验整定/设计选择）
 
-当前 Unity 平衡组：`alpha_on/off/emergency=4/1.5/8 deg`，
-`outer_kp/kd=2.5/0.4`，`inner_kp/ki=1.5/0.1`，最大角速度 `45 deg/s`，
-最大角加速度 `60 deg/s²`，力矩/变化率限额 `2.0/0.3 N*m`。
+当前 Unity 正方形轨迹组：`alpha_on/off/emergency=1.8/0.7/4.5 deg`，
+`outer_kp/kd=4.0/0.8`，`inner_kp/ki=2.0/0.1`，最大角速度 `45 deg/s`，
+最大角加速度 `90 deg/s²`，力矩/变化率限额 `1.5/0.25 N*m`。
 
 - [ ] `alpha_on`：正常平移跟踪仍可靠、但需要开始转头的视线角阈值。
 - [ ] `alpha_off`：必须小于 `alpha_on`，形成回差，避免反复切换。
