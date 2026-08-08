@@ -1,0 +1,43 @@
+{
+  "transport": {
+    "type": "tcp",
+    "host": "192.168.138.2",
+    "port": 5000,
+    "timeout_sec": 0.2,
+    "reconnect_interval_sec": 1.0,
+    "serial_port": "/dev/ttyUSB0",
+    "baudrate": 115200,
+    "bind_host": "0.0.0.0",
+    "bind_port": 54321,
+    "remote_host": "192.168.0.2",
+    "remote_port": 58766
+  },
+  "control": {
+    "period_sec": 0.05,
+    "telemetry_max_age_sec": 0.25,
+    "confirmation_max_age_sec": 0.25
+  },
+  "hardware_adapter": {
+    "positive_force_at_limit": [20.0, 15.0, 15.0],
+    "translation_channel_limits": [0.35, 0.35, 0.50],
+    "translation_signs": [1.0, 1.0, 1.0],
+    "positive_yaw_moment_at_limit": 4.0,
+    "yaw_channel_limit": 0.20,
+    "yaw_sign": 1.0
+  },
+  "thruster_feedback": {
+    "physical_order": [
+      "M1_LF_lower",
+      "M2_LF_upper",
+      "M3_LB_upper",
+      "M4_LB_lower",
+      "M5_RB_lower",
+      "M6_RB_upper",
+      "M7_RF_upper",
+      "M8_RF_lower"
+    ],
+    "dshot_rpm_available": true,
+    "use_rpm_for_force_estimate": false,
+    "calibration_status": "RPM is logged and echoed, but signed per-motor force curves must be measured on this vehicle before RPM is converted to Newtons."
+  }
+}

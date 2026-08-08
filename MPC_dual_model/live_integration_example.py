@@ -8,24 +8,61 @@ from __future__ import annotations
 
 import numpy as np
 
-from camera_transform import camera_to_body_position
-from dense_qp import QPSolverSettings
-from device_adapter import (
-    FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
-    FINESUB_V4_PRO1_FORCE_POSITIVE_N,
-    FineSUBThrusterAllocator,
-    ForceCommandAdapter,
-    finesub_translation_force_bounds,
-    finesub_translation_thruster_force_matrix,
-)
-from fossen_fixed_dl_model import FixedLinearDampingRelativeModel
-from mpc_controller import MPCConfig, RelativeMPCController
-from mpc_tracker import (
-    BaselineAdaptationConfig,
-    MPCTracker,
-    build_default_staircase_fusion,
-)
-from relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+try:
+    from .camera_transform import camera_to_body_position
+    from .dense_qp import QPSolverSettings
+    from .device_adapter import (
+        FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+        FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+        FineSUBThrusterAllocator,
+        ForceCommandAdapter,
+        finesub_translation_force_bounds,
+        finesub_translation_thruster_force_matrix,
+    )
+    from .finesub_protocol import (
+        FineSUBHardwareAdapter,
+        build_default_hardware_adapter,
+    )
+    from .fossen_fixed_dl_model import FixedLinearDampingRelativeModel
+    from .mpc_controller import MPCConfig, RelativeMPCController
+    from .mpc_tracker import (
+        BaselineAdaptationConfig,
+        MPCTracker,
+        build_default_staircase_fusion,
+    )
+    from .relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+except ImportError:
+    from camera_transform import camera_to_body_position
+    from dense_qp import QPSolverSettings
+    from device_adapter import (
+        FINESUB_V4_PRO1_FORCE_NEGATIVE_N,
+        FINESUB_V4_PRO1_FORCE_POSITIVE_N,
+        FineSUBThrusterAllocator,
+        ForceCommandAdapter,
+        finesub_translation_force_bounds,
+        finesub_translation_thruster_force_matrix,
+    )
+    from finesub_protocol import FineSUBHardwareAdapter, build_default_hardware_adapter
+    from fossen_fixed_dl_model import FixedLinearDampingRelativeModel
+    from mpc_controller import MPCConfig, RelativeMPCController
+    from mpc_tracker import (
+        BaselineAdaptationConfig,
+        MPCTracker,
+        build_default_staircase_fusion,
+    )
+    from relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+
+
+def build_hardware_adapter() -> FineSUBHardwareAdapter:
+    return build_default_hardware_adapter()
+
+
+def to_finesub_command(output, *, armed: bool, adapter=None):
+    """Convert fused translation output and retain the MCU's local yaw hold."""
+
+    hardware = adapter or build_hardware_adapter()
+    force = output.mpc.force if hasattr(output, "mpc") else output.force
+    return hardware.convert(force, 0.0, armed=armed, yaw_direct=False)
 
 
 def build_tracker() -> MPCTracker:

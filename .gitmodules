@@ -1,0 +1,3 @@
+[submodule "V4pro1_MPC"]
+	path = V4pro1_MPC
+	url = https://github.com/maerdofe-spec/V4pro1_MPC.git
