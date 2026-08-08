@@ -1,6 +1,13 @@
 """Experimental yaw-aware extension of the maintained dual-model MPC."""
 
 from .yaw_kalman import RotationAwareKalmanFilter
+from .yaw_controller import (
+    YawControlConfig,
+    YawControlResult,
+    YawMode,
+    YawPrediction,
+    YawStateController,
+)
 from .yaw_mpc_controller import (
     RotationAwareMPCController,
     YawMPCConfig,
@@ -9,9 +16,11 @@ from .yaw_mpc_controller import (
 from .yaw_relative_model import (
     LinearYawDynamics,
     RotationAwareRelativeModel,
+    body_to_visibility_position,
     line_of_sight_angle,
     rotation_body_from_previous,
     rotation_compensated_velocity,
+    visibility_frame_geometry,
     wrap_angle,
 )
 from .yaw_tracker import (
@@ -34,12 +43,19 @@ __all__ = [
     "RotationAwareRelativeModel",
     "YawMPCConfig",
     "YawMPCResult",
+    "YawControlConfig",
+    "YawControlResult",
+    "YawMode",
     "YawMomentChannelAdapter",
+    "YawPrediction",
     "YawSafeControlOutput",
+    "YawStateController",
     "YawTrackerOutput",
+    "body_to_visibility_position",
     "build_default_staircase_fusion",
     "line_of_sight_angle",
     "rotation_body_from_previous",
     "rotation_compensated_velocity",
+    "visibility_frame_geometry",
     "wrap_angle",
 ]

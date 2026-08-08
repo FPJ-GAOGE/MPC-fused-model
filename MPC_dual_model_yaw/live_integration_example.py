@@ -23,6 +23,7 @@ from MPC_dual_model.fossen_fixed_dl_model import (
 from MPC_dual_model.relative_kalman import KalmanConfig
 
 from .yaw_kalman import RotationAwareKalmanFilter
+from .yaw_controller import YawControlConfig, YawStateController
 from .yaw_mpc_controller import RotationAwareMPCController, YawMPCConfig
 from .yaw_relative_model import LinearYawDynamics, RotationAwareRelativeModel
 from .yaw_tracker import (
@@ -41,12 +42,30 @@ def build_tracker() -> RotationAwareMPCTracker:
         tau_base=np.zeros(3),
     )
     yaw = LinearYawDynamics(
-        # TODO: m_r=I_z-N_rdot and identified linear yaw damping.
+        # TODO: m_omega=I_z-N_rdot and identified yaw damping.
         effective_inertia=2.5,
         linear_damping=1.2,
+        quadratic_damping=0.0,
         dt=translation.dt,
     )
     model = RotationAwareRelativeModel(translation, yaw)
+    yaw_controller = YawStateController(
+        yaw,
+        YawControlConfig(
+            # TODO: determine FOV trigger hysteresis and all PID gains in pool tests.
+            alpha_on=np.deg2rad(25.0),
+            alpha_off=np.deg2rad(10.0),
+            alpha_emergency=np.deg2rad(35.0),
+            trigger_frames=3,
+            settle_frames=5,
+            omega_command_max=np.deg2rad(35.0),
+            omega_command_acceleration_max=np.deg2rad(60.0),
+            yaw_moment_min=-4.0,
+            yaw_moment_max=4.0,
+            delta_yaw_moment_min=-0.8,
+            delta_yaw_moment_max=0.8,
+        ),
+    )
     controller = RotationAwareMPCController(
         model,
         YawMPCConfig(
@@ -56,13 +75,6 @@ def build_tracker() -> RotationAwareMPCTracker:
             force_max=(20.0, 15.0, 15.0),
             delta_force_min=(-3.0, -2.0, -2.0),
             delta_force_max=(3.0, 2.0, 2.0),
-            # TODO: identify moment, moment-rate, and safe yaw-rate limits.
-            yaw_moment_min=-4.0,
-            yaw_moment_max=4.0,
-            delta_yaw_moment_min=-0.8,
-            delta_yaw_moment_max=0.8,
-            yaw_rate_min=-np.deg2rad(35.0),
-            yaw_rate_max=np.deg2rad(35.0),
         ),
     )
     estimator = RotationAwareKalmanFilter(
@@ -89,6 +101,7 @@ def build_tracker() -> RotationAwareMPCTracker:
         model=model,
         estimator=estimator,
         controller=controller,
+        yaw_controller=yaw_controller,
         force_adapter=force_adapter,
         yaw_adapter=yaw_adapter,
         fusion=fusion,
@@ -113,6 +126,12 @@ def one_control_update(
         rotation_body_from_camera=rotation_body_from_camera,
         camera_origin_in_body=camera_origin_in_body,
     )
+    rotation_body_from_camera = np.asarray(
+        rotation_body_from_camera, dtype=float
+    )
+    rotation_visibility_from_body = (
+        ALIGNED_OPENCV_TO_BODY @ rotation_body_from_camera.T
+    )
     return tracker.update(
         position_body=position_body,
         yaw_rad=imu_yaw_rad,
@@ -120,4 +139,6 @@ def one_control_update(
         force_achieved_previous=last_achieved_force_body,
         yaw_moment_achieved_previous=last_achieved_yaw_moment,
         roll_pitch_control=roll_pitch_control,
+        rotation_visibility_from_body=rotation_visibility_from_body,
+        camera_origin_in_body=camera_origin_in_body,
     )

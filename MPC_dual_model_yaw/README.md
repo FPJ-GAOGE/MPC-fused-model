@@ -1,113 +1,136 @@
-# 加入 yaw 旋转的双模型融合 MPC（实验版）
+# 加入 yaw 旋转的双模型融合 MPC
 
-本目录是基于同级 `MPC_dual_model` 的旋转实验层。坐标系仍为机体系 FRD：`x` 向前、`y` 向右、`z` 向下；正 yaw 表示艏部向右转。
+本目录是在 `MPC_dual_model` 平移融合代码上增加 yaw 后的实验版本。坐标约定为机体系 FRD：`x` 向前、`y` 向右、`z` 向下；正 yaw、正角速度 `omega` 和正力矩 `N` 均表示艏部向右转。
 
-控制输出扩展为：
+## 1. 当前控制结构
 
-```text
-u = [X, Y, Z, N]
-X/Y/Z: 机体系平移综合力 (N)
-N:     绕机体 z 轴的艏摇力矩 (N*m)
-```
-
-## 1. 这版实现的数学结构
-
-平移双模型仍为：
+本版与 PDF 的分层结构一致：
 
 ```text
-模型1: x_bar+ = A_d x + B_d (tau - tau_previous)
-模型2: x_bar+ = A_d x + B_d tau
+相机位置 + IMU yaw/omega
+        -> 旋转补偿卡尔曼滤波
+        -> 二维历史阶梯双模型融合
+        -> yaw HOLD/TURN/SETTLE 状态机
+        -> yaw 角度外环 + 角速度内环，得到 N
+        -> 冻结未来 psi/omega/N 轨迹
+        -> 三输入平移 QP，只优化 Delta tau=[Delta Fx,Delta Fy,Delta Fz]
+        -> 平移力与 yaw 力矩统一分配到推进器
 ```
 
-但 `x_bar+` 仍表达在旧机体系。若本周期 IMU 测得艏摇增量 `delta_psi`，统一转换到新机体系：
+`N` 不再是 QP 的第 4 个决策量。一次 QP 求解期间，yaw 目标及预测旋转矩阵固定；到下一实际控制周期，控制器根据新相机和 IMU 测量重新生成。
+
+## 2. 旋转相对运动模型
+
+目标位置 `p` 和平移相对速度 `v` 都在当前机体系表示。若一步内实际或预测 yaw 增量为 `Delta psi`：
 
 ```text
-T(delta_psi) = blockdiag(Rz(-delta_psi), Rz(-delta_psi))
-x+ = T(delta_psi) x_bar+
+R = Rz(-Delta psi)
+v[k+1] = R (F v[k] + G f_eff[k])
+p[k+1] = R p[k] + Ts v[k+1]
 ```
 
-因此纯转头、没有相对平移时：
+这与 PDF 的“先预测下一步速度，再做多步位置递推”一致。纯转头且没有平移时：
 
 ```text
-p[k] = Rz(-delta_psi) p[k-1]
-v_rel = (p[k] - Rz(-delta_psi)p[k-1]) / dt = 0
+p[k] = Rz(-Delta psi) p[k-1]
+v_rel = (p[k] - Rz(-Delta psi)p[k-1]) / Ts = 0
 ```
 
-不会再把转头产生的图像运动当成鱼的横向速度。
+因此转头产生的视觉运动不会被误认为目标的平移速度。
 
-Fossen 约化艏摇模型为：
+yaw 动力学采用：
 
 ```text
-m_r r_dot + d_r r = N
-psi_dot = r
-m_r = I_z - N_rdot
+m_omega * omega_dot
+  + d_omega * omega
+  + d_omega2 * |omega| * omega = N
+psi_dot = omega
 ```
 
-代码对线性艏摇模型进行精确零阶保持离散化。视线角为：
+线性部分精确离散，二次阻尼在单个采样周期内冻结。角度增量使用梯形积分：
 
 ```text
-alpha = atan2(p_y, p_x)
-alpha_dot = (p_x v_y - p_y v_x)/(p_x^2+p_y^2+epsilon) - r
+Delta psi[j] = Ts/2 * (omega[j] + omega[j+1])
 ```
 
-MPC 在位置、速度原代价之外增加 `alpha^2`、`r^2`、`N^2` 与 `delta_N^2`，并增加艏摇力矩、力矩变化率和角速度约束。
+而不是旧版的 `Ts*omega[j]`。
 
-## 2. 为什么仍能使用 QP
+## 3. yaw 状态机和双环 PID
 
-旋转矩阵中的 `sin/cos` 以及 `r*p`、`r*v` 会使完整模型成为非线性模型。第一版按设计对话中的“冻结旋转轨迹”实现：
+状态机定义于 `yaw_controller.py`：
 
-1. 本周期第一步使用 IMU 当前 `r`；
-2. 后续步使用上一轮 MPC 的预测 `r` 构造 `Rz(-dt*r)`；
-3. 视线角速度在同一条上一轮轨迹附近线性化；
-4. 本轮仍求解一个凸 QP；求解完成后更新下一轮冻结轨迹。
+- `HOLD`：保持当前长期艏向 `psi1`，主要依靠平移 MPC 跟踪。
+- `TURN`：当 `|alpha| >= alpha_on` 连续若干帧时，令 `psi2=wrap(psi+alpha)` 并转向。
+- `SETTLE`：目标回到 `alpha_off` 内后继续减速；实际角度、角速度和视线角连续满足完成条件后，执行 `psi1 <- psi2`。
 
-这是线性时变近似，不是完整非线性 MPC。实际 yaw 与历史模型评价始终使用 IMU 的真实角度增量，而不是冻结预测值。
-
-## 3. 与平移版一致的二维历史阶梯评价
-
-旋转版每个历史预测起点额外保存 `origin_index`。回放时，每一步都先使用实际执行力推进两个平移候选模型，再用该步实际 IMU yaw 增量把两个预测旋转到目标时刻机体系，最后将预测位置与同一目标时刻的滤波位置比较。
-
-令当前时刻为 `k`、回放起点为 `t0`、预测目标时刻为 `s`：
+偏航角使用相机光心射线，而不是机体原点到目标的方位角。令
+`R_vis_body` 把机体系向量转换到按 `[相机前、相机右、相机下]` 排列的可视坐标系，
+`r_bc` 为相机光心在机体系的位置，则：
 
 ```text
-r = k-t0
-h = s-t0
-1 <= h <= min(r, H, H_cap(r))
+p_vis = R_vis_body (p_body - r_bc)
+alpha = atan2(p_vis,right, p_vis,forward)
 ```
 
-默认值为：
+MPC 的水平、垂直视场约束也作用于同一个 `p_vis`，平移动力学状态仍为 `p_body`。
+
+外环根据 `wrap(psi_goal-psi)` 生成受最大角速度和最大角加速度限制的 `omega_command`；内环根据 `omega_command-omega` 生成受绝对值和变化率限制的 `N`。积分器带限幅和条件抗饱和。目标继续向视场外运动并超过紧急阈值时，只更新终点 `psi2`，不会重置当前 PID 状态。
+
+## 4. 平移双模型和 QP
+
+设模型一权重为逐轴对角矩阵 `A1`，`A2=I-A1`，决策变量为 `u[j]=Delta tau[j]`。融合速度为：
 
 ```text
-r:       1  2  3  4  5  6
-H_cap:   3  3  2  2  1  1
-omega_h: 0.5, 0.3, 0.2
-H:       3
+v[j+1] = R[j]Fv[j] + R[j]Gu[j] + A2 R[j]G tau[j-1]
 ```
 
-因此在 `k` 时刻，对于起点 `t0=k-3`：
+令 `e=p-p_d`，增广状态为：
 
-- `k-2|k-3`：保留，`h=1`；
-- `k-1|k-3`：保留，`h=2`；
-- `k|k-3`：排除，因为 `H_cap(3)=2`；
-- `k-3|k-3`：`h=0`，仅作为两个模型共同的滤波回放初值，不参与评分。
+```text
+x[j] = [e[j], v[j], tau[j-1]]
+tau[j] = tau[j-1] + u[j]
+```
 
-模型评分只在当前实际启用的阶梯格子上计算。时间衰减权重与 `omega_h` 相乘后，会在这些启用格子之间重新归一化，因此阶梯格子数量随时间变化不会无意改变 `M1/M2/C12` 的整体尺度。
+位置递推为：
 
-## 4. 文件
+```text
+e[j+1] = R[j]e[j] + Ts v[j+1] + (R[j]-I)p_d
+```
 
-- `yaw_relative_model.py`：离散旋转、旋转补偿差分、Fossen 艏摇动力学。
-- `yaw_kalman.py`：用实际 yaw 增量传播均值和协方差的 KF。
-- `yaw_mpc_controller.py`：四输入冻结旋转 LTV-MPC/QP。
-- `yaw_tracker.py`：时间顺序、双模型历史回放、FineSUB yaw 通道映射。
-- `live_integration_example.py`：构造控制器和单帧调用示例。
-- `example_yaw_simulation.py`：不连接硬件的闭环演示。
-- `tests/`：纯旋转、零旋转退化、QP 与推进器混控专项测试。
+这形成仿射线性时变模型 `x[j+1]=A[j]x[j]+B[j]u[j]+d[j]`，因此在冻结 yaw 轨迹后仍是凸 QP。
 
-该实验包复用主融合目录中已经验证过的 `dense_qp.py`、固定阻尼平移模型、双模型权重、相机转换和 FineSUB 分配器。因此两个目录必须保持同级。
+代价包括多步位置误差、速度、控制作用和力增量。默认 `force_cost_mode="effective"`，惩罚融合模型的有效输入代理：
 
-## 5. 安装、测试和仿真
+```text
+g[j] = Delta tau[j] + A2 tau[j-1]
+```
 
-在 `D:\FINSMCAT\Machine\MPC` 下运行：
+这减轻了此前的“模型一与绝对力代价冲突”。严格地说，动力学旧力项为
+`A2 R G tau_previous`，而该代理经过动力学矩阵后会成为
+`R G A2 tau_previous`；只有 `A2` 与 `R G` 可交换时才完全相同。若只为逐字复现 PDF
+中的 `tau' R tau`，可设置 `force_cost_mode="absolute"`。
+
+约束包括：
+
+- 三轴绝对力限制；
+- 三轴力增量限制；
+- 带松弛量的水平、垂直视场和前向距离限制。
+
+## 5. 二维历史阶梯评价
+
+旋转版继续使用：
+
+```text
+1 <= h <= min(r,H,H_cap(r))
+H_cap = [3,3,2,2,1,1]
+omega_h = [0.5,0.3,0.2]
+```
+
+历史回放每一步都使用实际执行力和实际 IMU yaw 增量，把两个模型预测转到同一目标时刻的机体系后再评分。`h=0` 只作为共同滤波起点，不参与评分；启用格子的权重会重新归一化。
+
+## 6. 运行
+
+在 `D:\FINSMCAT\Machine\MPC` 下：
 
 ```powershell
 python -m pip install -r .\MPC_dual_model_yaw\requirements.txt
@@ -115,73 +138,52 @@ python -m unittest discover -s .\MPC_dual_model_yaw\tests -v
 python -m MPC_dual_model_yaw.example_yaw_simulation
 ```
 
-本 yaw QP 默认强制使用 OSQP。当前机器的完整 tracker 基准约为平均 6 ms、95% 约 7 ms；NumPy ADMM 后备在同一问题上约为平均 59 ms，无法满足 20 Hz，所以本实验版不会静默退回它。若 OSQP 未安装，控制器会在构造时直接报错。
-
-## 6. 控制循环接口
+实时入口：
 
 ```python
-import numpy as np
 from MPC_dual_model_yaw.live_integration_example import (
     build_tracker,
     one_control_update,
 )
 
 tracker = build_tracker()
-last_force = np.zeros(3)
-last_yaw_moment = 0.0
-
-# AUTO 切入时，锁存实际保持力、实际 yaw 力矩和当前 IMU yaw。
 tracker.latch_baseline(last_force, last_yaw_moment, imu_yaw_rad)
 
 output = one_control_update(
     tracker=tracker,
-    position_camera_xyz=position_camera_xyz,  # [right, down, forward], m
+    position_camera_xyz=position_camera_xyz,
     imu_yaw_rad=imu_yaw_rad,
     imu_yaw_rate_rad_s=imu_yaw_rate_rad_s,
     last_achieved_force_body=last_force,
     last_achieved_yaw_moment=last_yaw_moment,
-    roll_pitch_control=(roll_pid, pitch_pid),
-    rotation_body_from_camera=R_bc,       # 实机标定的相机到机体系旋转
-    camera_origin_in_body=r_bc_body,      # 机体原点到相机原点的杠杆臂
+    rotation_body_from_camera=R_bc,
+    camera_origin_in_body=r_bc_body,
 )
 
 tau = output.mpc.force
-N = output.mpc.yaw_moment
-yaw_channel = output.yaw_channel
+N = output.yaw_control.yaw_moment
+mode = output.yaw_control.mode
 motor = output.thruster_allocation.throttles
-
-# 没有力/力矩观测器时，下面只能作为近似。
-last_force = tau.copy()
-last_yaw_moment = N
 ```
 
-相机位置、IMU yaw 和 IMU yaw rate 必须对齐到同一拍摄时刻。若相机有明显延迟，需先做时间戳历史更新和 IMU 姿态回放；当前实时入口尚未实现延迟图像回溯。
+相机位置、IMU yaw 和 IMU `omega` 必须对应同一拍摄时刻。`one_control_update()`
+会同时保留两套几何量：转换到机体系的位置供平移动力学和卡尔曼滤波使用；从相机光心
+出发的 `[前、右、下]` 视线射线供 yaw 状态机和水平/垂直视场约束使用。因此非零
+`r_bc_body` 或非正装相机不会凭空产生偏航误差。只能选择“发送高层力/姿态通道”或
+“直接发送八路推进器”其中一种执行链路，不能让 Python 和 MCU 重复混控。
 
-只能选择一种执行链路：要么发送高层平移命令并把 `yaw_channel` 送入 MCU 现有姿态混控，要么直接使用八路 `motor`。不能让 Python 与 MCU 对同一控制量重复混控。
+调用 `target_lost()` 后，安全力和 yaw 力矩仍按各自变化率限制逐拍退回锁存基准；同时
+旧目标的卡尔曼状态、融合历史、yaw 目标/PID 和时间基准会被清空。下一帧有效视觉测量
+会以当前 IMU yaw 建立新的 `HOLD` 方向，并从该测量重新初始化目标位置和速度，避免
+完成丢失前遗留的转向目标或把多帧缺测压缩成一次 `dt` 状态更新。
 
-## 7. 实机必须确定的参数
+## 7. 仍未解决的边界
 
-平移部分沿用主融合代码的标定项，yaw 新增：
+- 示例参数均是占位值，不能直接上实机。
+- 仅补偿 yaw，不包含 roll/pitch 对视觉相对坐标的旋转影响。
+- 尚未实现相机延迟的 IMU 历史回放。
+- 当前 `FineSUBThrusterAllocator` 仍是固件归一化混控复现；物理推力曲线、正反推力不对称和电池电压影响仍需标定。
+- 默认要求 OSQP；未安装时会在控制器构造阶段明确报错，不会在 20 Hz 循环中静默切换到较慢求解器。
 
-1. `effective_inertia = I_z-N_rdot`；
-2. `linear_damping = d_r`；
-3. `yaw_moment_min/max`；
-4. `delta_yaw_moment_min/max`；
-5. `yaw_rate_min/max`；
-6. `positive_yaw_moment_at_limit`；
-7. yaw 正负号 `YawMomentChannelAdapter.sign`；
-8. IMU yaw 与相机时间戳偏差、IMU 安装方向和角速度零偏；
-9. `line_of_sight_angle_weight`、`yaw_rate_weight`、`yaw_moment_weight`、`delta_yaw_moment_weight`；
-10. 平移与 yaw 同时工作时的推进器可达域。当前 QP 分别限制 `X/Y/Z/N`，尚未加入八推进器共同饱和形成的耦合多面体约束。
-11. 相机到机体系旋转 `R_bc` 和机体原点到相机原点杠杆臂 `r_bc_body`；加入 yaw 后杠杆臂误差会直接表现为周期性的假相对运动。
-
-所有示例数值只是软件占位值，不能直接用于实机。应先在纯软件仿真验证，再固定机体/拆桨确认六轴符号，然后在低限幅水池试验中辨识参数。
-
-## 8. 当前实验版仍有的边界
-
-- 只加入 yaw，不包含 roll/pitch 对相对坐标的旋转补偿；
-- 艏摇动力学暂时只有线性阻尼，没有 `d_rr*|r|*r` 和 surge-sway-yaw 耦合；
-- 冻结旋转轨迹是 QP 近似，大角速度或上一轮预测偏差大时应缩短步长或升级为 SQP/NMPC；
-- 视觉延迟回溯尚未实现；
-- yaw 力矩与平移力尚未使用完整 8 推进器控制分配可达域作联合约束；
-- 没有实际力/力矩观测器时，上一拍饱和命令仍只是已执行控制的近似。
+完整实机参数见 `CALIBRATION_CHECKLIST.md`；与 PDF 和参考推导的逐项差异见
+`MODEL_DIFFERENCES.md`。

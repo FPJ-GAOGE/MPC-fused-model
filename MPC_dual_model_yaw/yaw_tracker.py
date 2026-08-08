@@ -1,4 +1,4 @@
-"""Measurement -> rotation-aware filter -> fusion -> yaw MPC -> FineSUB mixer."""
+"""Measurement -> filter/fusion -> yaw PID -> translation MPC -> mixer."""
 
 from __future__ import annotations
 
@@ -17,11 +17,14 @@ from MPC_dual_model.fossen_fixed_dl_model import vector3
 from MPC_dual_model.model_fusion import FusionConfig, OnlineModelFusion
 
 from .yaw_kalman import RotationAwareKalmanFilter
+from .yaw_controller import YawControlResult, YawStateController
 from .yaw_mpc_controller import RotationAwareMPCController, YawMPCResult
 from .yaw_relative_model import (
     RotationAwareRelativeModel,
+    body_to_visibility_position,
     finite_scalar,
     line_of_sight_angle,
+    visibility_frame_geometry,
     wrap_angle,
 )
 
@@ -84,6 +87,7 @@ class YawTrackerOutput:
     yaw_rate: float
     line_of_sight_angle: float
     yaw_channel: float
+    yaw_control: YawControlResult
     mpc: YawMPCResult
     device_command: DeviceCommand
     thruster_allocation: ThrusterAllocation | None
@@ -121,6 +125,7 @@ class RotationAwareMPCTracker:
         model: RotationAwareRelativeModel,
         estimator: RotationAwareKalmanFilter,
         controller: RotationAwareMPCController,
+        yaw_controller: YawStateController,
         force_adapter: ForceCommandAdapter,
         yaw_adapter: YawMomentChannelAdapter,
         fusion: OnlineModelFusion | None = None,
@@ -128,9 +133,12 @@ class RotationAwareMPCTracker:
     ) -> None:
         if estimator.model is not model or controller.model is not model:
             raise ValueError("model, estimator.model, and controller.model must match")
+        if yaw_controller.model is not model.yaw:
+            raise ValueError("yaw_controller must use model.yaw")
         self.model = model
         self.estimator = estimator
         self.controller = controller
+        self.yaw_controller = yaw_controller
         self.force_adapter = force_adapter
         self.yaw_adapter = yaw_adapter
         self.fusion = fusion or build_default_staircase_fusion()
@@ -154,8 +162,10 @@ class RotationAwareMPCTracker:
         self._force_before_last = force.copy()
         self._yaw_moment_before_last = moment
         self._yaw_previous = None if yaw_rad is None else finite_scalar(yaw_rad, "yaw_rad")
+        self.estimator.reset()
         self.fusion.reset()
         self.controller.reset()
+        self.yaw_controller.reset(yaw_rad)
         self._pending.clear()
         self._frame_index = -1
 
@@ -164,11 +174,29 @@ class RotationAwareMPCTracker:
         force_achieved_previous,
         yaw_moment_achieved_previous: float,
     ) -> YawSafeControlOutput:
-        self.controller.reset()
-        self._pending.clear()
-        force, moment = self.controller.safe_input(
-            force_achieved_previous, yaw_moment_achieved_previous
+        achieved_force = vector3(
+            force_achieved_previous, "force_achieved_previous"
         )
+        achieved_moment = finite_scalar(
+            yaw_moment_achieved_previous, "yaw_moment_achieved_previous"
+        )
+        force = self.controller.safe_force(achieved_force)
+        moment = self.yaw_controller.safe_moment(achieved_moment)
+
+        # A measurement gap has unknown duration in this interface.  Discard
+        # all target-dependent state so the next valid camera frame starts a
+        # fresh track instead of compressing the whole gap into one dt step or
+        # completing a stale yaw goal.
+        self.estimator.reset()
+        self.fusion.reset()
+        self.controller.reset()
+        self.yaw_controller.reset()
+        self._pending.clear()
+        self._force_before_last = achieved_force.copy()
+        self._yaw_moment_before_last = achieved_moment
+        self._yaw_previous = None
+        self._frame_index = -1
+
         yaw_channel = self.yaw_adapter.convert(moment)
         return YawSafeControlOutput(
             force=force,
@@ -230,6 +258,8 @@ class RotationAwareMPCTracker:
         yaw_moment_achieved_previous: float,
         reference_position=None,
         roll_pitch_control=(0.0, 0.0),
+        rotation_visibility_from_body=None,
+        camera_origin_in_body=(0.0, 0.0, 0.0),
     ) -> YawTrackerOutput:
         force = vector3(force_achieved_previous, "force_achieved_previous")
         yaw = finite_scalar(yaw_rad, "yaw_rad")
@@ -240,6 +270,10 @@ class RotationAwareMPCTracker:
         roll_pitch = np.asarray(roll_pitch_control, dtype=float).reshape(-1)
         if roll_pitch.shape != (2,) or not np.all(np.isfinite(roll_pitch)):
             raise ValueError("roll_pitch_control must be finite with shape (2,)")
+        visibility_rotation, camera_origin = visibility_frame_geometry(
+            rotation_visibility_from_body,
+            camera_origin_in_body,
+        )
 
         self._frame_index += 1
         if not self.estimator.initialized:
@@ -277,13 +311,27 @@ class RotationAwareMPCTracker:
         self._force_before_last = force.copy()
         self._yaw_moment_before_last = yaw_moment
         self._start_prediction(state, force)
+        position_visibility = body_to_visibility_position(
+            state[:3],
+            visibility_rotation,
+            camera_origin,
+        )
+        alpha = line_of_sight_angle(position_visibility)
+        yaw_control = self.yaw_controller.update(
+            yaw_angle=yaw,
+            yaw_rate=yaw_rate,
+            alpha=alpha,
+            previous_achieved_moment=yaw_moment,
+            horizon=self.controller.config.horizon,
+        )
         result = self.controller.solve(
             state=state,
-            yaw_rate=yaw_rate,
             force_previous=force,
-            yaw_moment_previous=yaw_moment,
+            yaw_prediction=yaw_control.prediction,
             reference_position=reference_position,
             model1_weight=self.fusion.model1_weight,
+            rotation_visibility_from_body=visibility_rotation,
+            camera_origin_in_body=camera_origin,
         )
         yaw_channel = self.yaw_adapter.convert(result.yaw_moment)
         attitude_control = (roll_pitch[0], roll_pitch[1], yaw_channel)
@@ -297,8 +345,9 @@ class RotationAwareMPCTracker:
         return YawTrackerOutput(
             estimated_state=state,
             yaw_rate=yaw_rate,
-            line_of_sight_angle=line_of_sight_angle(state[:3]),
+            line_of_sight_angle=alpha,
             yaw_channel=yaw_channel,
+            yaw_control=yaw_control,
             mpc=result,
             device_command=self.force_adapter.convert(result.force),
             thruster_allocation=allocation,

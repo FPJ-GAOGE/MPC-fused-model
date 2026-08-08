@@ -46,13 +46,22 @@ class RotationModelTest(unittest.TestCase):
         current = np.deg2rad(-179.0)
         self.assertAlmostEqual(wrap_angle(current - previous), np.deg2rad(2.0))
 
-    def test_zero_yaw_reduces_to_original_translation_model(self) -> None:
+    def test_zero_yaw_uses_pdf_end_velocity_position_update(self) -> None:
         translation, model = self.build()
         state = np.array([1.0, 0.2, -0.1, 0.1, -0.03, 0.02])
         force = np.array([2.0, -1.0, 0.5])
-        expected = translation.A_d @ state + translation.B_d @ force
+        velocity_next = translation.F @ state[3:] + translation.G @ force
+        expected = np.concatenate(
+            (state[:3] + translation.dt * velocity_next, velocity_next)
+        )
         actual = model.predict_model2(state, force, delta_yaw_rad=0.0)
         np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+    def test_yaw_step_uses_trapezoidal_integration(self) -> None:
+        _, model = self.build()
+        psi_next, omega_next, delta = model.yaw.predict_yaw_step(0.2, 0.1, 0.4)
+        self.assertAlmostEqual(delta, 0.5 * model.dt * (0.1 + omega_next))
+        self.assertAlmostEqual(psi_next, wrap_angle(0.2 + delta))
 
     def test_filter_keeps_zero_translation_during_pure_yaw(self) -> None:
         _, model = self.build()

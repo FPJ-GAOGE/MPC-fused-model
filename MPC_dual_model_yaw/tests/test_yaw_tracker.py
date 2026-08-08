@@ -7,6 +7,7 @@ from MPC_dual_model.device_adapter import (
     FineSUBThrusterAllocator,
     ForceCommandAdapter,
 )
+from MPC_dual_model.camera_transform import ALIGNED_OPENCV_TO_BODY
 from MPC_dual_model.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel,
 )
@@ -16,6 +17,11 @@ from MPC_dual_model.model_fusion import (
 )
 from MPC_dual_model_yaw.yaw_kalman import (
     RotationAwareKalmanFilter,
+)
+from MPC_dual_model_yaw.live_integration_example import one_control_update
+from MPC_dual_model_yaw.yaw_controller import (
+    YawControlConfig,
+    YawStateController,
 )
 from MPC_dual_model_yaw.yaw_mpc_controller import (
     RotationAwareMPCController,
@@ -58,6 +64,17 @@ class YawTrackerTest(unittest.TestCase):
                 ),
             ),
         )
+        yaw_controller = YawStateController(
+            model.yaw,
+            YawControlConfig(
+                alpha_on=0.10,
+                alpha_off=0.05,
+                alpha_emergency=0.60,
+                trigger_frames=1,
+                settle_frames=2,
+                omega_command_acceleration_max=10.0,
+            ),
+        )
         fusion = OnlineModelFusion(
             FusionConfig(window=3, prediction_horizon=2)
         )
@@ -65,6 +82,7 @@ class YawTrackerTest(unittest.TestCase):
             model=model,
             estimator=RotationAwareKalmanFilter(model),
             controller=controller,
+            yaw_controller=yaw_controller,
             force_adapter=ForceCommandAdapter(),
             yaw_adapter=YawMomentChannelAdapter(
                 positive_yaw_moment_at_limit=4.0,
@@ -167,6 +185,107 @@ class YawTrackerTest(unittest.TestCase):
                 > 0.0
             )
         )
+
+    def test_camera_lever_arm_does_not_create_false_yaw_or_fov_error(self) -> None:
+        tracker, _ = self.build()
+        camera_origin = np.array([0.0, 0.35, 0.0])
+        target_body = np.array([1.0, 0.35, 0.0])
+        output = tracker.update(
+            position_body=target_body,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            force_achieved_previous=np.zeros(3),
+            yaw_moment_achieved_previous=0.0,
+            reference_position=target_body,
+            rotation_visibility_from_body=np.eye(3),
+            camera_origin_in_body=camera_origin,
+        )
+        self.assertAlmostEqual(output.line_of_sight_angle, 0.0, places=12)
+        self.assertAlmostEqual(output.mpc.yaw_moment, 0.0, places=12)
+        self.assertLess(np.max(output.mpc.slacks), 1.0e-5)
+
+    def test_arbitrary_camera_mount_keeps_optical_axis_centered(self) -> None:
+        tracker, _ = self.build()
+        camera_yaw = 0.40
+        cosine = np.cos(camera_yaw)
+        sine = np.sin(camera_yaw)
+        rotation_body_from_visibility = np.array(
+            [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]]
+        )
+        rotation_body_from_camera = (
+            rotation_body_from_visibility @ ALIGNED_OPENCV_TO_BODY
+        )
+        output = one_control_update(
+            tracker=tracker,
+            position_camera_xyz=(0.0, 0.0, 1.0),
+            imu_yaw_rad=0.0,
+            imu_yaw_rate_rad_s=0.0,
+            last_achieved_force_body=np.zeros(3),
+            last_achieved_yaw_moment=0.0,
+            rotation_body_from_camera=rotation_body_from_camera,
+            camera_origin_in_body=(0.0, 0.20, 0.0),
+        )
+        self.assertAlmostEqual(output.line_of_sight_angle, 0.0, places=12)
+        self.assertAlmostEqual(output.mpc.yaw_moment, 0.0, places=12)
+
+    def test_target_reacquisition_discards_stale_turn_and_filter_state(self) -> None:
+        tracker, fusion = self.build()
+        before_loss = tracker.update(
+            position_body=(1.0, 0.35, 0.0),
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            force_achieved_previous=np.zeros(3),
+            yaw_moment_achieved_previous=0.0,
+        )
+        self.assertEqual(before_loss.yaw_control.mode.value, "TURN")
+        self.assertGreater(before_loss.mpc.yaw_moment, 0.0)
+
+        safe = tracker.target_lost(
+            force_achieved_previous=before_loss.mpc.force,
+            yaw_moment_achieved_previous=before_loss.mpc.yaw_moment,
+        )
+        self.assertFalse(tracker.estimator.initialized)
+        self.assertFalse(tracker.yaw_controller.initialized)
+        self.assertEqual(fusion.sample_count, 0)
+
+        reacquired = tracker.update(
+            position_body=(2.0, 0.0, 0.0),
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            force_achieved_previous=safe.force,
+            yaw_moment_achieved_previous=safe.yaw_moment,
+        )
+        self.assertEqual(reacquired.yaw_control.mode.value, "HOLD")
+        self.assertAlmostEqual(reacquired.yaw_control.goal_angle, 0.0, places=12)
+        self.assertAlmostEqual(reacquired.mpc.yaw_moment, 0.0, places=12)
+        np.testing.assert_allclose(
+            reacquired.estimated_state,
+            np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            atol=1.0e-12,
+        )
+        self.assertEqual(fusion.sample_count, 0)
+
+    def test_latch_baseline_starts_a_fresh_target_track(self) -> None:
+        tracker, fusion = self.build()
+        tracker.update(
+            position_body=(1.0, 0.1, 0.0),
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            force_achieved_previous=np.zeros(3),
+            yaw_moment_achieved_previous=0.0,
+        )
+        self.assertTrue(tracker.estimator.initialized)
+
+        tracker.latch_baseline(
+            force_achieved=(0.2, -0.1, 0.0),
+            yaw_moment_achieved=0.05,
+            yaw_rad=0.20,
+        )
+        self.assertFalse(tracker.estimator.initialized)
+        self.assertTrue(tracker.yaw_controller.initialized)
+        self.assertEqual(tracker.yaw_controller.mode.value, "HOLD")
+        self.assertAlmostEqual(tracker.yaw_controller.goal_angle, 0.20)
+        self.assertEqual(fusion.sample_count, 0)
 
 
 if __name__ == "__main__":

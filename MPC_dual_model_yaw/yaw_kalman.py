@@ -27,6 +27,10 @@ class RotationAwareKalmanFilter:
         self.H = np.hstack((np.eye(3), np.zeros((3, 3))))
         self.R = np.diag(vector3(self.config.position_std, "position_std") ** 2)
         self.Q = self._process_covariance()
+        self.reset()
+
+    def reset(self) -> None:
+        """Discard the previous target track before a fresh acquisition."""
         self.x = np.zeros(6)
         self.P = np.eye(6)
         self.initialized = False
