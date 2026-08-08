@@ -4,6 +4,24 @@
 实机入口 `rov_track_control3.py`，并通过树莓派 TCP-UART 桥接到
 `v4ROV2/FineSUB` 的 USART3。
 
+## 克隆完整工程
+
+`V4pro1_MPC` 固件以 Git 子模块接入本仓库，固件内部的 CMSIS-DSP 和 ETL
+也保持为子模块。首次克隆时请递归拉取：
+
+```powershell
+git clone --recurse-submodules https://github.com/maerdofe-spec/MPC-fused-model.git
+```
+
+已有工作目录可执行：
+
+```powershell
+git submodule update --init --recursive
+```
+
+固件也可在独立仓库查看：
+[V4pro1_MPC](https://github.com/maerdofe-spec/V4pro1_MPC)。
+
 ## 实机控制链路
 
 控制坐标统一为机体系 FRD：x 向前、y 向右、z 向下，正偏航力矩使艇首
