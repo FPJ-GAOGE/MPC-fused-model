@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from MPC_dual_model.finesub_protocol import (
+    FineSUBHardwareAdapter,
+    build_default_hardware_adapter,
+)
+
 try:
     from .camera_transform import camera_to_body_position
     from .device_adapter import FineSUBThrusterAllocator, ForceCommandAdapter
@@ -18,6 +23,18 @@ except ImportError:
     from mpc_controller import MPCConfig, RelativeMPCController
     from mpc_tracker import MPCTracker
     from relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+
+
+def build_hardware_adapter() -> FineSUBHardwareAdapter:
+    return build_default_hardware_adapter()
+
+
+def to_finesub_command(output, *, armed: bool, adapter=None):
+    """Convert model-1 output while retaining the MCU's local yaw hold."""
+
+    hardware = adapter or build_hardware_adapter()
+    force = output.mpc.force if hasattr(output, "mpc") else output.force
+    return hardware.convert(force, 0.0, armed=armed, yaw_direct=False)
 
 
 def build_tracker() -> MPCTracker:

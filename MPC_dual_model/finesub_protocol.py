@@ -1,0 +1,698 @@
+"""FineSUB v3 wire protocol and achieved-wrench reconstruction.
+
+The four MPC variants work in SI body-frame wrench units (FRD: forward,
+right, down, with positive yaw turning the bow right).  Firmware commands use
+bounded mixer channels, while telemetry reports the command decision, the
+eight physical motor set-points, and the eight DSHOT RPM measurements.
+
+The applied motor set-points are deliberately reconstructed back through the
+firmware mixer before they are passed to ``tau_achieved_previous``.  This makes
+the estimator and both MPC model families use what the lower controller
+actually applied instead of assuming that every requested channel survived
+mixing and saturation unchanged.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import struct
+import time
+
+import numpy as np
+
+try:
+    from .fossen_fixed_dl_model import vector3
+except ImportError:  # Support direct execution from this model directory.
+    from fossen_fixed_dl_model import vector3
+
+
+PROTOCOL_VERSION = 3
+
+COMMAND_SYNC = b"\xAA\x4D"
+TELEMETRY_SYNC = b"\x55\x54"
+TELEMETRY_MESSAGE_STATE_EXECUTION = 0x01
+
+COMMAND_FLAG_ARMED = 0x01
+COMMAND_FLAG_MPC_DIRECT = 0x02
+COMMAND_FLAG_YAW_DIRECT = 0x04
+
+TELEMETRY_FLAG_ARMED = 0x01
+TELEMETRY_FLAG_MPC_DIRECT = 0x02
+TELEMETRY_FLAG_FAILSAFE = 0x04
+TELEMETRY_FLAG_YAW_DIRECT = 0x08
+TELEMETRY_FLAG_EXECUTION_FEEDBACK = 0x10
+TELEMETRY_FLAG_RPM_AVAILABLE = 0x20
+
+COMMAND_STATUS_NONE = 0
+COMMAND_STATUS_ACCEPTED = 1
+COMMAND_STATUS_REJECTED = 2
+
+COMMAND_REJECT_CRC = 1 << 0
+COMMAND_REJECT_VERSION = 1 << 1
+COMMAND_REJECT_FLAGS = 1 << 2
+COMMAND_REJECT_NONFINITE = 1 << 3
+COMMAND_REJECT_STALE_SEQUENCE = 1 << 4
+COMMAND_REJECT_SESSION_REQUIRES_DISARM = 1 << 5
+COMMAND_REJECT_FORMAT = 1 << 6
+
+# command: sync, version, flags, sequence, session, sender monotonic ms,
+#          forward/right/down/yaw, CRC16
+_COMMAND_BODY = struct.Struct("<2sBBHIIffff")
+
+# telemetry header: sync, message type, version, payload length, sequence,
+#                   MCU tick, payload, CRC16
+_TELEMETRY_HEADER = struct.Struct("<2sBBHHI")
+
+# telemetry payload integer section followed by 33 float32 values:
+# flags, state, command status, RPM-valid mask,
+# reject flags, command session, command sequence, command CRC,
+# sender monotonic ms, command count, rejected count,
+# quat[4], angular velocity[3], acceleration[3], yaw, depth, pressure,
+# received mixer channels[4], applied physical motor throttle[8], RPM[8].
+_TELEMETRY_PAYLOAD = struct.Struct("<BBBBIIHHIII33f")
+_CRC = struct.Struct("<H")
+
+COMMAND_FRAME_SIZE = _COMMAND_BODY.size + _CRC.size
+TELEMETRY_PAYLOAD_SIZE = _TELEMETRY_PAYLOAD.size
+TELEMETRY_FRAME_SIZE = _TELEMETRY_HEADER.size + TELEMETRY_PAYLOAD_SIZE + _CRC.size
+
+MOTOR_COUNT = 8
+
+# These are the exact matrices and final motor signs used by V5_SUB.hpp.
+# Physical motor order is M1..M8 as built in TaskSUB.cpp.
+_LOWER_MIXER = np.asarray(
+    [
+        [1.0, -1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, -1.0, -1.0],
+    ],
+    dtype=float,
+)  # columns: yaw, forward, right
+_UPPER_MIXER = np.asarray(
+    [
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, -1.0],
+    ],
+    dtype=float,
+)  # columns: roll, pitch, down
+
+
+def _finite_scalar(value: float, name: str) -> float:
+    scalar = float(value)
+    if not np.isfinite(scalar):
+        raise ValueError(f"{name} must be finite")
+    return scalar
+
+
+def _finite_tuple(value, length: int, name: str) -> tuple[float, ...]:
+    array = np.asarray(value, dtype=float).reshape(-1)
+    if array.size != length:
+        raise ValueError(f"{name} must contain {length} values")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    return tuple(float(item) for item in array)
+
+
+def crc16_modbus(data: bytes | bytearray | memoryview) -> int:
+    """Return CRC-16/MODBUS, matching ``CRC16Calc`` in FineSUB."""
+
+    crc = 0xFFFF
+    for value in data:
+        crc ^= int(value)
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
+def is_newer_u16_sequence(current: int, previous: int) -> bool:
+    """Return whether ``current`` is newer using modulo-16-bit ordering."""
+
+    delta = (int(current) - int(previous)) & 0xFFFF
+    return 0 < delta < 0x8000
+
+
+@dataclass(frozen=True)
+class FineSUBControlCommand:
+    """Normalized mixer channels requested from the lower controller."""
+
+    forward: float
+    right: float
+    down: float
+    yaw: float
+    armed: bool
+    yaw_direct: bool = True
+
+    def __post_init__(self) -> None:
+        _finite_tuple(
+            (self.forward, self.right, self.down, self.yaw),
+            4,
+            "FineSUB control channels",
+        )
+
+
+@dataclass(frozen=True)
+class FineSUBCommandEnvelope:
+    command: FineSUBControlCommand
+    sequence: int
+    session_id: int
+    sender_time_ms: int
+    crc: int
+
+
+@dataclass(frozen=True)
+class FineSUBTelemetry:
+    sequence: int
+    tick_ms: int
+    state: int
+    armed: bool
+    mpc_direct: bool
+    yaw_direct: bool
+    failsafe: bool
+    yaw_rad: float
+    yaw_rate_rad_s: float
+    depth_m: float
+    forward: float
+    right: float
+    down: float
+    yaw: float
+    command_status: int = COMMAND_STATUS_NONE
+    reject_flags: int = 0
+    last_command_session: int = 0
+    last_command_sequence: int = 0
+    last_command_crc: int = 0
+    last_command_sender_time_ms: int = 0
+    command_count: int = 0
+    rejected_command_count: int = 0
+    quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    angular_velocity_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    linear_acceleration_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pressure_pa: float = 0.0
+    applied_motor_throttle: tuple[float, ...] = (0.0,) * MOTOR_COUNT
+    motor_rpm: tuple[float, ...] = (0.0,) * MOTOR_COUNT
+    execution_feedback_valid: bool = False
+    rpm_available: bool = False
+    rpm_valid_mask: int = 0
+    received_monotonic: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        _finite_tuple(
+            (
+                self.yaw_rad,
+                self.yaw_rate_rad_s,
+                self.depth_m,
+                self.forward,
+                self.right,
+                self.down,
+                self.yaw,
+                self.pressure_pa,
+                self.received_monotonic,
+            ),
+            9,
+            "FineSUB telemetry scalars",
+        )
+        object.__setattr__(
+            self,
+            "quat_wxyz",
+            _finite_tuple(self.quat_wxyz, 4, "quat_wxyz"),
+        )
+        object.__setattr__(
+            self,
+            "angular_velocity_xyz",
+            _finite_tuple(
+                self.angular_velocity_xyz,
+                3,
+                "angular_velocity_xyz",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "linear_acceleration_xyz",
+            _finite_tuple(
+                self.linear_acceleration_xyz,
+                3,
+                "linear_acceleration_xyz",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "applied_motor_throttle",
+            _finite_tuple(
+                self.applied_motor_throttle,
+                MOTOR_COUNT,
+                "applied_motor_throttle",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "motor_rpm",
+            _finite_tuple(self.motor_rpm, MOTOR_COUNT, "motor_rpm"),
+        )
+
+    @property
+    def last_command_accepted(self) -> bool:
+        return self.command_status == COMMAND_STATUS_ACCEPTED
+
+    @property
+    def last_command_rejected(self) -> bool:
+        return self.command_status == COMMAND_STATUS_REJECTED
+
+
+def is_newer_telemetry(
+    current: FineSUBTelemetry,
+    previous: FineSUBTelemetry,
+) -> bool:
+    """Accept forward progress or a clearly disarmed controller reboot."""
+
+    if is_newer_u16_sequence(current.sequence, previous.sequence):
+        return True
+    return (
+        not current.armed
+        and current.sequence < 8
+        and current.tick_ms < previous.tick_ms
+    )
+
+
+def motor_throttles_to_channels(
+    motor_throttle,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Invert the exact FineSUB mixer from physical M1..M8 set-points.
+
+    Returns ``(translation_channels, yaw_channel, roll_pitch_channels)``.
+    The mixer columns are orthogonal, so the inverse is the transpose divided
+    by four.  Final per-motor signs in ``V5_SUB::MotorPowerDistribution`` are
+    undone before inversion.
+    """
+
+    physical = np.asarray(
+        _finite_tuple(motor_throttle, MOTOR_COUNT, "motor_throttle"),
+        dtype=float,
+    )
+    lower = np.asarray(
+        [physical[0], -physical[3], physical[4], -physical[7]],
+        dtype=float,
+    )
+    upper = np.asarray(
+        [physical[1], -physical[2], physical[5], physical[6]],
+        dtype=float,
+    )
+    yaw_forward_right = _LOWER_MIXER.T @ lower / 4.0
+    roll_pitch_down = _UPPER_MIXER.T @ upper / 4.0
+    translation = np.asarray(
+        [yaw_forward_right[1], yaw_forward_right[2], roll_pitch_down[2]],
+        dtype=float,
+    )
+    return translation, float(yaw_forward_right[0]), roll_pitch_down[:2]
+
+
+@dataclass
+class FineSUBHardwareAdapter:
+    """Convert between MPC wrench units and bounded firmware mixer channels."""
+
+    positive_force_at_limit: object = (20.0, 15.0, 15.0)
+    translation_channel_limits: object = (0.35, 0.35, 0.50)
+    translation_signs: object = (1.0, 1.0, 1.0)
+    positive_yaw_moment_at_limit: float = 4.0
+    yaw_channel_limit: float = 0.20
+    yaw_sign: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.positive_force_at_limit = vector3(
+            self.positive_force_at_limit, "positive_force_at_limit"
+        )
+        self.translation_channel_limits = vector3(
+            self.translation_channel_limits, "translation_channel_limits"
+        )
+        self.translation_signs = vector3(
+            self.translation_signs, "translation_signs"
+        )
+        self.positive_yaw_moment_at_limit = _finite_scalar(
+            self.positive_yaw_moment_at_limit,
+            "positive_yaw_moment_at_limit",
+        )
+        self.yaw_channel_limit = _finite_scalar(
+            self.yaw_channel_limit, "yaw_channel_limit"
+        )
+        self.yaw_sign = _finite_scalar(self.yaw_sign, "yaw_sign")
+        if np.any(self.positive_force_at_limit <= 0.0):
+            raise ValueError("positive_force_at_limit must be positive")
+        if np.any(self.translation_channel_limits <= 0.0):
+            raise ValueError("translation_channel_limits must be positive")
+        if np.any(np.abs(self.translation_signs) != 1.0):
+            raise ValueError("translation_signs entries must be +1 or -1")
+        if self.positive_yaw_moment_at_limit <= 0.0:
+            raise ValueError("positive_yaw_moment_at_limit must be positive")
+        if self.yaw_channel_limit <= 0.0:
+            raise ValueError("yaw_channel_limit must be positive")
+        if abs(self.yaw_sign) != 1.0:
+            raise ValueError("yaw_sign must be +1 or -1")
+
+    def convert(
+        self,
+        force_body,
+        yaw_moment: float,
+        *,
+        armed: bool,
+        yaw_direct: bool = True,
+    ) -> FineSUBControlCommand:
+        force = vector3(force_body, "force_body")
+        moment = _finite_scalar(yaw_moment, "yaw_moment")
+        translation = np.clip(
+            self.translation_signs
+            * force
+            / self.positive_force_at_limit
+            * self.translation_channel_limits,
+            -self.translation_channel_limits,
+            self.translation_channel_limits,
+        )
+        yaw = float(
+            np.clip(
+                self.yaw_sign
+                * moment
+                / self.positive_yaw_moment_at_limit
+                * self.yaw_channel_limit,
+                -self.yaw_channel_limit,
+                self.yaw_channel_limit,
+            )
+        )
+        return FineSUBControlCommand(
+            forward=float(translation[0]),
+            right=float(translation[1]),
+            down=float(translation[2]),
+            yaw=yaw,
+            armed=bool(armed),
+            yaw_direct=bool(yaw_direct),
+        )
+
+    def _channels_to_wrench(
+        self,
+        translation_channels,
+        yaw_channel: float,
+    ) -> tuple[np.ndarray, float]:
+        channels = vector3(translation_channels, "translation_channels")
+        force = (
+            channels
+            / self.translation_channel_limits
+            * self.positive_force_at_limit
+            / self.translation_signs
+        )
+        moment = (
+            float(yaw_channel)
+            / self.yaw_channel_limit
+            * self.positive_yaw_moment_at_limit
+            / self.yaw_sign
+        )
+        return force, float(moment)
+
+    def achieved_wrench(
+        self, telemetry: FineSUBTelemetry
+    ) -> tuple[np.ndarray, float]:
+        """Return the wrench that actually survived lower-controller mixing.
+
+        V3 telemetry carries the eight physical motor set-points.  They are
+        inverted through the exact firmware mixer before conversion to SI
+        units.  The four received channels remain a compatibility fallback for
+        recordings made before execution feedback was enabled.
+        """
+
+        if telemetry.failsafe or not telemetry.armed or not telemetry.mpc_direct:
+            return np.zeros(3, dtype=float), 0.0
+        if telemetry.execution_feedback_valid:
+            translation, yaw, _roll_pitch = motor_throttles_to_channels(
+                telemetry.applied_motor_throttle
+            )
+        else:
+            translation = np.asarray(
+                [telemetry.forward, telemetry.right, telemetry.down],
+                dtype=float,
+            )
+            yaw = telemetry.yaw
+        return self._channels_to_wrench(translation, yaw)
+
+
+def build_default_hardware_adapter() -> FineSUBHardwareAdapter:
+    """Return conservative initial calibration for all four MPC variants."""
+
+    return FineSUBHardwareAdapter(
+        # Replace these wrench limits after a vehicle-specific bollard test.
+        positive_force_at_limit=(20.0, 15.0, 15.0),
+        translation_channel_limits=(0.35, 0.35, 0.50),
+        translation_signs=(1.0, 1.0, 1.0),
+        positive_yaw_moment_at_limit=4.0,
+        yaw_channel_limit=0.20,
+        yaw_sign=1.0,
+    )
+
+
+def pack_command(
+    command: FineSUBControlCommand,
+    sequence: int,
+    *,
+    session_id: int = 0,
+    sender_time_ms: int = 0,
+) -> bytes:
+    flags = COMMAND_FLAG_MPC_DIRECT
+    if command.armed:
+        flags |= COMMAND_FLAG_ARMED
+    if command.yaw_direct:
+        flags |= COMMAND_FLAG_YAW_DIRECT
+    body = _COMMAND_BODY.pack(
+        COMMAND_SYNC,
+        PROTOCOL_VERSION,
+        flags,
+        int(sequence) & 0xFFFF,
+        int(session_id) & 0xFFFFFFFF,
+        int(sender_time_ms) & 0xFFFFFFFF,
+        command.forward,
+        command.right,
+        command.down,
+        command.yaw,
+    )
+    return body + _CRC.pack(crc16_modbus(body))
+
+
+def unpack_command_frame(frame: bytes) -> FineSUBCommandEnvelope:
+    if len(frame) != COMMAND_FRAME_SIZE:
+        raise ValueError(f"command frame must be {COMMAND_FRAME_SIZE} bytes")
+    body = frame[:-_CRC.size]
+    received_crc = _CRC.unpack_from(frame, len(body))[0]
+    if crc16_modbus(body) != received_crc:
+        raise ValueError("command CRC mismatch")
+    (
+        sync,
+        version,
+        flags,
+        sequence,
+        session_id,
+        sender_time_ms,
+        forward,
+        right,
+        down,
+        yaw,
+    ) = _COMMAND_BODY.unpack(body)
+    if sync != COMMAND_SYNC or version != PROTOCOL_VERSION:
+        raise ValueError("unsupported command frame")
+    if not flags & COMMAND_FLAG_MPC_DIRECT:
+        raise ValueError("command is not an MPC-direct frame")
+    return FineSUBCommandEnvelope(
+        command=FineSUBControlCommand(
+            forward=forward,
+            right=right,
+            down=down,
+            yaw=yaw,
+            armed=bool(flags & COMMAND_FLAG_ARMED),
+            yaw_direct=bool(flags & COMMAND_FLAG_YAW_DIRECT),
+        ),
+        sequence=sequence,
+        session_id=session_id,
+        sender_time_ms=sender_time_ms,
+        crc=received_crc,
+    )
+
+
+def unpack_command(frame: bytes) -> tuple[FineSUBControlCommand, int]:
+    """Compatibility helper returning the command and sequence only."""
+
+    decoded = unpack_command_frame(frame)
+    return decoded.command, decoded.sequence
+
+
+def pack_telemetry(telemetry: FineSUBTelemetry) -> bytes:
+    """Reference encoder used by tests and hardware-loop recordings."""
+
+    flags = 0
+    if telemetry.armed:
+        flags |= TELEMETRY_FLAG_ARMED
+    if telemetry.mpc_direct:
+        flags |= TELEMETRY_FLAG_MPC_DIRECT
+    if telemetry.yaw_direct:
+        flags |= TELEMETRY_FLAG_YAW_DIRECT
+    if telemetry.failsafe:
+        flags |= TELEMETRY_FLAG_FAILSAFE
+    if telemetry.execution_feedback_valid:
+        flags |= TELEMETRY_FLAG_EXECUTION_FEEDBACK
+    if telemetry.rpm_available:
+        flags |= TELEMETRY_FLAG_RPM_AVAILABLE
+
+    angular = list(telemetry.angular_velocity_xyz)
+    angular[2] = float(telemetry.yaw_rate_rad_s)
+    floats = (
+        *telemetry.quat_wxyz,
+        *angular,
+        *telemetry.linear_acceleration_xyz,
+        telemetry.yaw_rad,
+        telemetry.depth_m,
+        telemetry.pressure_pa,
+        telemetry.forward,
+        telemetry.right,
+        telemetry.down,
+        telemetry.yaw,
+        *telemetry.applied_motor_throttle,
+        *telemetry.motor_rpm,
+    )
+    payload = _TELEMETRY_PAYLOAD.pack(
+        flags,
+        int(telemetry.state) & 0xFF,
+        int(telemetry.command_status) & 0xFF,
+        int(telemetry.rpm_valid_mask) & 0xFF,
+        int(telemetry.reject_flags) & 0xFFFFFFFF,
+        int(telemetry.last_command_session) & 0xFFFFFFFF,
+        int(telemetry.last_command_sequence) & 0xFFFF,
+        int(telemetry.last_command_crc) & 0xFFFF,
+        int(telemetry.last_command_sender_time_ms) & 0xFFFFFFFF,
+        int(telemetry.command_count) & 0xFFFFFFFF,
+        int(telemetry.rejected_command_count) & 0xFFFFFFFF,
+        *floats,
+    )
+    header = _TELEMETRY_HEADER.pack(
+        TELEMETRY_SYNC,
+        TELEMETRY_MESSAGE_STATE_EXECUTION,
+        PROTOCOL_VERSION,
+        len(payload),
+        int(telemetry.sequence) & 0xFFFF,
+        int(telemetry.tick_ms) & 0xFFFFFFFF,
+    )
+    body = header + payload
+    return body + _CRC.pack(crc16_modbus(body))
+
+
+def unpack_telemetry(frame: bytes) -> FineSUBTelemetry:
+    if len(frame) < _TELEMETRY_HEADER.size + _CRC.size:
+        raise ValueError("telemetry frame is too short")
+    sync, message_type, version, payload_len, sequence, tick_ms = (
+        _TELEMETRY_HEADER.unpack_from(frame)
+    )
+    if sync != TELEMETRY_SYNC:
+        raise ValueError("invalid telemetry sync")
+    if message_type != TELEMETRY_MESSAGE_STATE_EXECUTION:
+        raise ValueError(f"unsupported telemetry type {message_type}")
+    if version != PROTOCOL_VERSION:
+        raise ValueError(f"unsupported telemetry version {version}")
+    expected_size = _TELEMETRY_HEADER.size + payload_len + _CRC.size
+    if len(frame) != expected_size:
+        raise ValueError(f"unexpected telemetry frame size {len(frame)}")
+    if payload_len != TELEMETRY_PAYLOAD_SIZE:
+        raise ValueError(f"unexpected telemetry payload size {payload_len}")
+    body = frame[:-_CRC.size]
+    if crc16_modbus(body) != _CRC.unpack_from(frame, len(body))[0]:
+        raise ValueError("telemetry CRC mismatch")
+
+    unpacked = _TELEMETRY_PAYLOAD.unpack_from(frame, _TELEMETRY_HEADER.size)
+    flags = int(unpacked[0])
+    float_values = unpacked[11:]
+    quat = tuple(float(value) for value in float_values[0:4])
+    angular = tuple(float(value) for value in float_values[4:7])
+    acceleration = tuple(float(value) for value in float_values[7:10])
+    received = float_values[13:17]
+    applied = tuple(float(value) for value in float_values[17:25])
+    rpm = tuple(float(value) for value in float_values[25:33])
+    return FineSUBTelemetry(
+        sequence=sequence,
+        tick_ms=tick_ms,
+        state=int(unpacked[1]),
+        armed=bool(flags & TELEMETRY_FLAG_ARMED),
+        mpc_direct=bool(flags & TELEMETRY_FLAG_MPC_DIRECT),
+        yaw_direct=bool(flags & TELEMETRY_FLAG_YAW_DIRECT),
+        failsafe=bool(flags & TELEMETRY_FLAG_FAILSAFE),
+        yaw_rad=float(float_values[10]),
+        yaw_rate_rad_s=float(angular[2]),
+        depth_m=float(float_values[11]),
+        forward=float(received[0]),
+        right=float(received[1]),
+        down=float(received[2]),
+        yaw=float(received[3]),
+        command_status=int(unpacked[2]),
+        reject_flags=int(unpacked[4]),
+        last_command_session=int(unpacked[5]),
+        last_command_sequence=int(unpacked[6]),
+        last_command_crc=int(unpacked[7]),
+        last_command_sender_time_ms=int(unpacked[8]),
+        command_count=int(unpacked[9]),
+        rejected_command_count=int(unpacked[10]),
+        quat_wxyz=quat,  # type: ignore[arg-type]
+        angular_velocity_xyz=angular,  # type: ignore[arg-type]
+        linear_acceleration_xyz=acceleration,  # type: ignore[arg-type]
+        pressure_pa=float(float_values[12]),
+        applied_motor_throttle=applied,
+        motor_rpm=rpm,
+        execution_feedback_valid=bool(
+            flags & TELEMETRY_FLAG_EXECUTION_FEEDBACK
+        ),
+        rpm_available=bool(flags & TELEMETRY_FLAG_RPM_AVAILABLE),
+        rpm_valid_mask=int(unpacked[3]),
+    )
+
+
+class TelemetryStreamDecoder:
+    """Recover variable-length telemetry frames from a fragmented byte stream."""
+
+    def __init__(self, *, max_payload_size: int = 512) -> None:
+        self._buffer = bytearray()
+        self._max_payload_size = int(max_payload_size)
+        self.dropped_bytes = 0
+        self.crc_errors = 0
+        self.decode_errors = 0
+
+    def reset(self) -> None:
+        self._buffer.clear()
+
+    def feed(self, data: bytes) -> list[FineSUBTelemetry]:
+        if data:
+            self._buffer.extend(data)
+        decoded: list[FineSUBTelemetry] = []
+        while True:
+            start = self._buffer.find(TELEMETRY_SYNC)
+            if start < 0:
+                if self._buffer.endswith(TELEMETRY_SYNC[:1]):
+                    self.dropped_bytes += max(0, len(self._buffer) - 1)
+                    del self._buffer[:-1]
+                else:
+                    self.dropped_bytes += len(self._buffer)
+                    self._buffer.clear()
+                break
+            if start:
+                self.dropped_bytes += start
+                del self._buffer[:start]
+            if len(self._buffer) < _TELEMETRY_HEADER.size:
+                break
+            payload_len = struct.unpack_from("<H", self._buffer, 4)[0]
+            if payload_len > self._max_payload_size:
+                self.decode_errors += 1
+                del self._buffer[0]
+                continue
+            frame_size = _TELEMETRY_HEADER.size + payload_len + _CRC.size
+            if len(self._buffer) < frame_size:
+                break
+            candidate = bytes(self._buffer[:frame_size])
+            try:
+                decoded.append(unpack_telemetry(candidate))
+                del self._buffer[:frame_size]
+            except ValueError as error:
+                if "CRC mismatch" in str(error):
+                    self.crc_errors += 1
+                else:
+                    self.decode_errors += 1
+                del self._buffer[0]
+        return decoded

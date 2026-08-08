@@ -20,6 +20,10 @@ from MPC_dual_model.device_adapter import (
 from MPC_dual_model.fossen_fixed_dl_model import (
     FixedLinearDampingRelativeModel,
 )
+from MPC_dual_model.finesub_protocol import (
+    FineSUBHardwareAdapter,
+    build_default_hardware_adapter,
+)
 from MPC_dual_model.relative_kalman import KalmanConfig
 
 from .yaw_kalman import RotationAwareKalmanFilter
@@ -31,6 +35,23 @@ from .yaw_tracker import (
     YawMomentChannelAdapter,
     build_default_staircase_fusion,
 )
+
+
+def build_hardware_adapter() -> FineSUBHardwareAdapter:
+    return build_default_hardware_adapter()
+
+
+def to_finesub_command(output, *, armed: bool, adapter=None):
+    """Convert translation force and yaw moment for full upper-level control."""
+
+    hardware = adapter or build_hardware_adapter()
+    if hasattr(output, "mpc"):
+        force = output.mpc.force
+        moment = output.yaw_control.yaw_moment
+    else:
+        force = output.force
+        moment = output.yaw_moment
+    return hardware.convert(force, moment, armed=armed, yaw_direct=True)
 
 
 def build_tracker() -> RotationAwareMPCTracker:
