@@ -1,0 +1,269 @@
+{
+  "dataset": "closed_loop_comparison_20260818",
+  "description": "Extracted per-case samples and exact smoothed mean curves used by the two 2026-08-18 figures.",
+  "window_s": 20.0,
+  "bin_s": 0.1,
+  "reference_forward_m": 0.857634,
+  "error_definition": "signed_error_cm = 100 * (forward_m - reference_forward_m); absolute_error_cm = abs(signed_error_cm)",
+  "phase_annotation": {
+    "motion_stage_s": [
+      0.0,
+      15.0
+    ],
+    "emergency_stop_s": 15.0,
+    "post_stop_observation_s": [
+      15.0,
+      20.0
+    ]
+  },
+  "figures": {
+    "figure1": {
+      "name": "fusion_vs_fixed",
+      "groups": {
+        "fusion": 3,
+        "model1_fixed": 3,
+        "model2_fixed": 3
+      },
+      "sample_file": "figure1_fusion_fixed_case_samples.csv",
+      "curve_file": "figure1_fusion_fixed_plotted_curve.csv",
+      "summary_source": "../../calibration_logs/mpc_fusion_vs_fixed_200cm_20260818.json",
+      "cases": [
+        {
+          "label": "融合 034641",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_034641.jsonl",
+          "window_start_host_time_s": 1786996001.8310375,
+          "window_end_host_time_s": 1786996021.8310375,
+          "sample_count": 188,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "融合 035124",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_035124.jsonl",
+          "window_start_host_time_s": 1786996284.8211083,
+          "window_end_host_time_s": 1786996304.8211083,
+          "sample_count": 188,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "融合 035442",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_035442.jsonl",
+          "window_start_host_time_s": 1786996486.9625778,
+          "window_end_host_time_s": 1786996506.9625778,
+          "sample_count": 186,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "固定 model1（原图）",
+          "method": "model1_fixed",
+          "source": "experimental_auto_20260818_032311_model1fixed_realtime.jsonl",
+          "window_start_host_time_s": 1786994665.4665375,
+          "window_end_host_time_s": 1786994685.4665375,
+          "sample_count": 190,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "固定 model2（原图）",
+          "method": "model2_fixed",
+          "source": "experimental_auto_20260818_033331_model2fixed_realtime.jsonl",
+          "window_start_host_time_s": 1786995243.3810353,
+          "window_end_host_time_s": 1786995263.3810353,
+          "sample_count": 188,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "固定 model1-A",
+          "method": "model1_fixed",
+          "source": "experimental_auto_20260818_184023.jsonl",
+          "window_start_host_time_s": 1787049650.8127177,
+          "window_end_host_time_s": 1787049670.8127177,
+          "sample_count": 184,
+          "selection_method": "pool-top camera motion segment start + 20 s"
+        },
+        {
+          "label": "固定 model1-B",
+          "method": "model1_fixed",
+          "source": "experimental_auto_20260818_184336.jsonl",
+          "window_start_host_time_s": 1787049838.112539,
+          "window_end_host_time_s": 1787049858.112539,
+          "sample_count": 189,
+          "selection_method": "pool-top camera motion segment start + 20 s"
+        },
+        {
+          "label": "固定 model2-A",
+          "method": "model2_fixed",
+          "source": "experimental_auto_20260818_184822.jsonl",
+          "window_start_host_time_s": 1787050122.6805718,
+          "window_end_host_time_s": 1787050142.6805718,
+          "sample_count": 183,
+          "selection_method": "pool-top camera motion segment start + 20 s"
+        },
+        {
+          "label": "固定 model2-B",
+          "method": "model2_fixed",
+          "source": "experimental_auto_20260818_185011.jsonl",
+          "window_start_host_time_s": 1787050228.146228,
+          "window_end_host_time_s": 1787050248.146228,
+          "sample_count": 187,
+          "selection_method": "pool-top camera motion segment start + 20 s"
+        }
+      ]
+    },
+    "figure2": {
+      "name": "pid_smc_fusion",
+      "groups": {
+        "pid": 3,
+        "smc": 3,
+        "fusion": 3
+      },
+      "sample_file": "figure2_pid_smc_fusion_case_samples.csv",
+      "curve_file": "figure2_pid_smc_fusion_plotted_curve.csv",
+      "summary_source": "../../calibration_logs/pid_smc_model_comparison_20260818.json",
+      "cases": [
+        {
+          "label": "PID 第1段",
+          "method": "pid",
+          "source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/pid_live_20260818_185403/pipeline_results.jsonl",
+          "window_start_host_time_s": 1787050557.65,
+          "window_end_host_time_s": 1787050577.65,
+          "sample_count": 197,
+          "selection_method": "pipeline_results.jsonl frame_ts_mean window",
+          "coordinate_frame": "body-FRD",
+          "source_position_field": "tracks[0].position [right, down, forward]"
+        },
+        {
+          "label": "PID 第2段",
+          "method": "pid",
+          "source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/pid_live_20260818_185403/pipeline_results.jsonl",
+          "window_start_host_time_s": 1787050617.65,
+          "window_end_host_time_s": 1787050637.65,
+          "sample_count": 197,
+          "selection_method": "pipeline_results.jsonl frame_ts_mean window",
+          "coordinate_frame": "body-FRD",
+          "source_position_field": "tracks[0].position [right, down, forward]"
+        },
+        {
+          "label": "PID 第3段",
+          "method": "pid",
+          "source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/pid_live_20260818_185403/pipeline_results.jsonl",
+          "window_start_host_time_s": 1787050657.65,
+          "window_end_host_time_s": 1787050677.65,
+          "sample_count": 197,
+          "selection_method": "pipeline_results.jsonl frame_ts_mean window",
+          "coordinate_frame": "body-FRD",
+          "source_position_field": "tracks[0].position [right, down, forward]"
+        },
+        {
+          "label": "SMC 第1段",
+          "method": "smc",
+          "source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/smc_real_20260818_203056.jsonl",
+          "window_start_host_time_s": 1787056685.72,
+          "window_end_host_time_s": 1787056705.72,
+          "sample_count": 189,
+          "selection_method": "池顶相机分段起点 + 15 s 运动 + 5 s 延长观察",
+          "camera_source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/top_camera_experiment_20260818_203056/top_camera_experiment_20260818_203056_0.db3",
+          "stereo_source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/final_real_yolo_only_20260818_203056_smc/pipeline_results.jsonl"
+        },
+        {
+          "label": "SMC 第3段",
+          "method": "smc",
+          "source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/smc_real_20260818_203056.jsonl",
+          "window_start_host_time_s": 1787056809.62,
+          "window_end_host_time_s": 1787056829.62,
+          "sample_count": 187,
+          "selection_method": "池顶相机分段起点 + 15 s 运动 + 5 s 延长观察",
+          "camera_source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/top_camera_experiment_20260818_203056/top_camera_experiment_20260818_203056_0.db3",
+          "stereo_source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/final_real_yolo_only_20260818_203056_smc/pipeline_results.jsonl"
+        },
+        {
+          "label": "SMC 第4段",
+          "method": "smc",
+          "source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/smc_real_20260818_203056.jsonl",
+          "window_start_host_time_s": 1787056926.32,
+          "window_end_host_time_s": 1787056946.32,
+          "sample_count": 181,
+          "selection_method": "池顶相机分段起点 + 15 s 运动 + 5 s 延长观察",
+          "camera_source": "/home/fins/Zhouyuheng_workspace/MPC/calibration_logs/top_camera_experiment_20260818_203056/top_camera_experiment_20260818_203056_0.db3",
+          "stereo_source": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/final_real_yolo_only_20260818_203056_smc/pipeline_results.jsonl"
+        },
+        {
+          "label": "融合 034641",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_034641.jsonl",
+          "window_start_host_time_s": 1786996001.8310375,
+          "window_end_host_time_s": 1786996021.8310375,
+          "sample_count": 188,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "融合 035124",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_035124.jsonl",
+          "window_start_host_time_s": 1786996284.8211083,
+          "window_end_host_time_s": 1786996304.8211083,
+          "sample_count": 188,
+          "selection_method": "original figure manual window"
+        },
+        {
+          "label": "融合 035442",
+          "method": "fusion",
+          "source": "experimental_auto_20260818_035442.jsonl",
+          "window_start_host_time_s": 1786996486.9625778,
+          "window_end_host_time_s": 1786996506.9625778,
+          "sample_count": 186,
+          "selection_method": "original figure manual window"
+        }
+      ]
+    }
+  },
+  "unique_method_groups_in_figures": [
+    "pid",
+    "smc",
+    "fusion",
+    "model1_fixed",
+    "model2_fixed"
+  ],
+  "unique_method_group_count": 5,
+  "method_group_note": "The two figures together contain five unique method groups: PID, SMC, fusion model, fixed model1, and fixed model2.",
+  "summary_metrics": {
+    "figure1": {
+      "fusion": [
+        5.585119213148886,
+        3.978750372634797,
+        2.8475429296720947,
+        3.8871623893766447
+      ],
+      "model1_fixed": [
+        4.385193686311614,
+        3.952902495838906,
+        5.886077385972292,
+        6.957999317176699
+      ],
+      "model2_fixed": [
+        8.111680473992058,
+        7.9464683885610805,
+        9.567496286463081,
+        4.022349907704235
+      ]
+    },
+    "figure2": {
+      "pid": {
+        "mean_abs_error_cm": 5.2258808307880145,
+        "p95_abs_error_cm": 11.80926791562621,
+        "max_abs_error_cm": 20.592726053996802
+      },
+      "smc": {
+        "mean_abs_error_cm": 6.8390365387660905,
+        "p95_abs_error_cm": 11.453457849228016,
+        "max_abs_error_cm": 14.671038579411256
+      },
+      "fusion": {
+        "mean_abs_error_cm": 4.07283680541572,
+        "p95_abs_error_cm": 8.871571363437162,
+        "max_abs_error_cm": 18.78006921418717
+      }
+    }
+  }
+}
